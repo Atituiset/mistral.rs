@@ -259,7 +259,7 @@ fn verify_qwen3_arch(
         .cloned()
         .try_value_into()?;
 
-    if actual_arch != "qwen3" && actual_arch != "qwen3moe" {
+    if actual_arch != "qwen3" && actual_arch != "qwen3moe" && actual_arch != "qwen35moe" {
         candle_core::bail!("Expected `qwen3` architecture, got `{actual_arch}`.");
     }
     Ok(actual_arch)
