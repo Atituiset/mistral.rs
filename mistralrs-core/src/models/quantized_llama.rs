@@ -747,6 +747,22 @@ impl ModelWeights {
         cache: &mut [KvCache],
     ) -> Result<Tensor> {
         let mut layer_in = hidden.to_device(&self.device)?;
+        let seq_len = hidden.dims()[1];
+        let kv_offsets = [past_kv_len];
+        let kv_ref: &[usize] = &kv_offsets;
+        let kv_len_cache: &dyn PastKvLenCache = &kv_ref;
+        let mask = if seq_len > 1 {
+            let dummy_ids = Tensor::zeros((1, seq_len), DType::U32, &self.device)?;
+            let attention_mask = CausalMasker.make_causal_mask(
+                &dummy_ids,
+                kv_len_cache,
+                self.dtype,
+                &CausalMaskConfig::default(),
+            )?;
+            DeviceMappedMask::from_single(attention_mask)
+        } else {
+            DeviceMappedMask::from_single(AttentionMask::None)
+        };
         for (i, layer) in self.layers.iter().enumerate() {
             if i < start_layer || i > end_layer {
                 continue;
@@ -758,10 +774,9 @@ impl ModelWeights {
             let x = layer_in;
             let residual = &x;
             let x = layer.attention_norm.forward(&x)?;
-            // For remote worker: single-token decode, mask = None
             let attn = layer.forward_attn(
                 &x,
-                &AttentionMask::None,
+                &mask.get(x.device()),
                 &[past_kv_len],
                 &mut cache[i],
                 None,
