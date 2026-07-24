@@ -999,7 +999,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 )?;
 
                 let attention_norm = ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
-                let ffn_norm = ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?;
+                let ffn_norm = if ct.has_tensor(&format!("{prefix}.post_attention_norm.weight")) {
+                    ct.tensor(&format!("{prefix}.post_attention_norm.weight"), device)?
+                } else {
+                    ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?
+                };
                 let paged_attn = match &attention_mechanism {
                     AttentionImplementation::Eager => None,
                     AttentionImplementation::PagedAttention => {

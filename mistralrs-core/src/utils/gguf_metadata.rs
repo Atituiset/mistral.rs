@@ -330,7 +330,10 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 };
                 token_embd + output_norm + output
             }
-            GGUFArchitecture::Qwen2 | GGUFArchitecture::Qwen3 | GGUFArchitecture::Qwen3MoE => {
+            GGUFArchitecture::Qwen2
+            | GGUFArchitecture::Qwen3
+            | GGUFArchitecture::Qwen3MoE
+            | GGUFArchitecture::Qwen35MoE => {
                 let token_embd = tensor_info_size_in_bytes!(
                     self.model.tensor_info("token_embd.weight")?,
                     DType::F32
@@ -495,57 +498,91 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
 
                 attn_norm + ffn_norm + attn_qkv + attn_output + ffn_up + ffn_down
             }
-            GGUFArchitecture::Qwen2 | GGUFArchitecture::Qwen3 | GGUFArchitecture::Qwen3MoE => {
+            GGUFArchitecture::Qwen2
+            | GGUFArchitecture::Qwen3
+            | GGUFArchitecture::Qwen3MoE
+            | GGUFArchitecture::Qwen35MoE => {
                 let attn_norm = tensor_info_size_in_bytes!(
                     self.model.tensor_info("blk.0.attn_norm.weight")?,
                     DType::F32
                 );
-                let ffn_norm = tensor_info_size_in_bytes!(
-                    self.model.tensor_info("blk.0.ffn_norm.weight")?,
-                    DType::F32
-                );
+                let ffn_norm = if self.arch == GGUFArchitecture::Qwen35MoE
+                    && self.model.has_tensor("blk.0.post_attention_norm.weight")
+                {
+                    tensor_info_size_in_bytes!(
+                        self.model.tensor_info("blk.0.post_attention_norm.weight")?,
+                        DType::F32
+                    )
+                } else {
+                    tensor_info_size_in_bytes!(
+                        self.model.tensor_info("blk.0.ffn_norm.weight")?,
+                        DType::F32
+                    )
+                };
 
-                let mut attn_q =
-                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_q.weight")?);
-                if let GGUFArchitecture::Qwen2 = self.arch {
-                    attn_q +=
-                        tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_q.bias")?);
-                }
-                let mut attn_k =
-                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_k.weight")?);
-                if let GGUFArchitecture::Qwen2 = self.arch {
-                    attn_k +=
-                        tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_k.bias")?);
-                }
+                let is_ssm_blk0 = self.arch == GGUFArchitecture::Qwen35MoE
+                    && self.model.has_tensor("blk.0.ssm_conv1d.weight");
+                let attn_size = if is_ssm_blk0 {
+                    tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_qkv.weight")?)
+                        + tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info("blk.0.attn_gate.weight")?)
+                        + tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info("blk.0.ssm_out.weight")?)
+                        + tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info("blk.0.ssm_conv1d.weight")?)
+                } else {
+                    let mut attn_q = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_q.weight")?);
+                    if let GGUFArchitecture::Qwen2 = self.arch {
+                        attn_q += tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info("blk.0.attn_q.bias")?);
+                    }
+                    let mut attn_k = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_k.weight")?);
+                    if let GGUFArchitecture::Qwen2 = self.arch {
+                        attn_k += tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info("blk.0.attn_k.bias")?);
+                    }
+                    let mut attn_v = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_v.weight")?);
+                    if let GGUFArchitecture::Qwen2 = self.arch {
+                        attn_v += tensor_info_size_in_bytes!(self
+                            .model
+                            .tensor_info("blk.0.attn_v.bias")?);
+                    }
+                    let attn_output = tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.attn_output.weight")?);
+                    attn_q + attn_k + attn_v + attn_output
+                };
 
-                let mut attn_v =
-                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_v.weight")?);
-                if let GGUFArchitecture::Qwen2 = self.arch {
-                    attn_v +=
-                        tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_v.bias")?);
-                }
-
-                let attn_output = tensor_info_size_in_bytes!(self
-                    .model
-                    .tensor_info("blk.0.attn_output.weight")?);
-
-                let ffn_gate = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                let is_moe = self.arch == GGUFArchitecture::Qwen3MoE
+                    || self.arch == GGUFArchitecture::Qwen35MoE;
+                let ffn_gate = if is_moe {
                     tensor_info_size_in_bytes!(self
                         .model
                         .tensor_info("blk.0.ffn_gate_exps.weight")?)
                 } else {
                     tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_gate.weight")?)
                 };
-
-                let ffn_up = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                let ffn_up = if is_moe {
                     tensor_info_size_in_bytes!(self
                         .model
                         .tensor_info("blk.0.ffn_up_exps.weight")?)
                 } else {
                     tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_up.weight")?)
                 };
-
-                let ffn_down = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                let ffn_down = if is_moe {
                     tensor_info_size_in_bytes!(self
                         .model
                         .tensor_info("blk.0.ffn_down_exps.weight")?)
@@ -553,15 +590,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_down.weight")?)
                 };
 
-                attn_norm
-                    + ffn_norm
-                    + attn_q
-                    + attn_k
-                    + attn_v
-                    + attn_output
-                    + ffn_gate
-                    + ffn_up
-                    + ffn_down
+                attn_norm + ffn_norm + attn_size + ffn_gate + ffn_up + ffn_down
             }
             GGUFArchitecture::Starcoder2 => {
                 let attn_norm = tensor_info_size_in_bytes!(
