@@ -276,10 +276,6 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         let mut ropes = HashMap::new();
         for layer_idx in 0..block_count {
-            if mapper.is_layer_remote(layer_idx) {
-                layers.push(None);
-                continue;
-            }
             let device = mapper.device_for(layer_idx, false).unwrap_or(device);
             ropes.insert(
                 device.location(),
