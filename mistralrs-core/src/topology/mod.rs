@@ -195,11 +195,11 @@ impl Topology {
             }
 
             let (start, end) = if selector.contains('-') {
-                // Range (inclusive, exclusive)
+                // Range (inclusive, inclusive) -- end+1 for exclusive internal use
                 let Some((start, end)) = selector.splitn(2, '-').collect_tuple() else {
                     anyhow::bail!("Topology range segment must follow the format START-END")
                 };
-                (start.parse::<usize>()?, end.parse::<usize>()?)
+                (start.parse::<usize>()?, end.parse::<usize>()? + 1)
             } else {
                 // Single layer here
                 let layer = selector.parse::<usize>()?;

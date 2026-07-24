@@ -860,8 +860,11 @@ impl Pipeline for GGUFPipeline {
         end_layer: usize,
         past_kv_len: usize,
     ) -> candle_core::Result<Tensor> {
+        eprintln!("[PIPELINE] forward_from_layer: layers={}-{} past_kv={}", start_layer, end_layer, past_kv_len);
         let mut cache_guard = self.cache().normal();
-        self.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, &mut cache_guard.0)
+        let result = self.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, &mut cache_guard.0);
+        eprintln!("[PIPELINE] forward_from_layer: done layers={}-{}", start_layer, end_layer);
+        result
     }
 
     fn reset_kv_cache(&self) -> candle_core::Result<()> {

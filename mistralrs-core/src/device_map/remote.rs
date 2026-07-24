@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -59,6 +60,7 @@ impl RemoteConnectionPool {
         layer_end: u32,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
+        eprintln!("[BRIDGE] roundtrip: addr={addr} cmd={cmd} layers={layer_start}-{layer_end} payload_len={}", payload.len());
         let mut guard = self
             .connections
             .get(addr)
@@ -194,6 +196,11 @@ pub struct RemoteLayerMapper {
     remote_blocks: Vec<(String, usize, usize)>,
     /// Map from layer index to remote block index
     layer_to_block: Vec<Option<usize>>,
+    /// Tracks the last remote block we computed. When the model calls map() for
+    /// subsequent layers in the same block we return the input unchanged -- the
+    /// forward loop already has the output of the preceding layer.
+    /// usize::MAX means "none".
+    last_remote_block: AtomicUsize,
 }
 
 impl RemoteLayerMapper {
@@ -238,6 +245,7 @@ impl RemoteLayerMapper {
             layer_specs,
             remote_blocks,
             layer_to_block,
+            last_remote_block: AtomicUsize::new(usize::MAX),
         }
     }
 }
@@ -255,13 +263,23 @@ impl DeviceMapper for RemoteLayerMapper {
     fn map(&self, input: Tensor, layer: usize) -> Result<Tensor> {
         match self.layer_specs.get(layer) {
             Some(RemoteAwareDevice::Local(_)) => self.local_mapper.map(input, layer),
-            Some(RemoteAwareDevice::Remote { addr }) => {
+            Some(RemoteAwareDevice::Remote { addr: _ }) => {
                 let block_idx = self.layer_to_block[layer].unwrap();
                 let (addr, start, end) = &self.remote_blocks[block_idx];
+
+                // Only compute the full block on the first layer; for subsequent
+                // layers the forward loop already carries the block output.
+                if layer != *start {
+                    return Ok(input);
+                }
+
+                eprintln!("[BRIDGE] map: layer={layer} remote={addr}");
                 let payload = serialize_tensor(&input)?;
                 let resp = self
                     .connection_pool
                     .roundtrip(addr, 0x00, *start as u32, *end as u32, &payload)?;
+                self.last_remote_block
+                    .store(block_idx, std::sync::atomic::Ordering::Relaxed);
                 deserialize_tensor(&resp, &Device::Cpu)
             }
             None => {
