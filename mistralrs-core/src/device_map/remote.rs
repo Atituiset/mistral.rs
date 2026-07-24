@@ -277,6 +277,7 @@ impl DeviceMapper for RemoteLayerMapper {
                 }
 
                 eprintln!("[BRIDGE] map: layer={layer} remote={addr}");
+                let target_device = input.device().clone();
                 let payload = serialize_tensor(&input)?;
                 let past_kv = self.past_kv.load(std::sync::atomic::Ordering::Relaxed);
                 let resp = self
@@ -284,7 +285,9 @@ impl DeviceMapper for RemoteLayerMapper {
                     .roundtrip(addr, 0x00, *start as u32, *end as u32, past_kv, &payload)?;
                 self.last_remote_block
                     .store(block_idx, std::sync::atomic::Ordering::Relaxed);
-                deserialize_tensor(&resp, &Device::Cpu)
+                let cpu_result = deserialize_tensor(&resp, &Device::Cpu)?;
+                eprintln!("[BRIDGE] map: moving result from CPU to {target_device:?}");
+                cpu_result.to_device(&target_device)
             }
             None => {
                 // Layer beyond known range, pass through
