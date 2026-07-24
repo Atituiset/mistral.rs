@@ -127,7 +127,7 @@ impl LayerWeights {
 
 pub struct ModelWeights {
     tok_embeddings: Embedding,
-    layers: Vec<LayerWeights>,
+    layers: Vec<Option<LayerWeights>>,
     output_norm: LayerNorm,
     output: QLinear,
     pub device: Device,
@@ -256,6 +256,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
             &new_multi_progress(),
         ) {
             let prefix = format!("blk.{layer_idx}");
+            if mapper.is_layer_remote(layer_idx) {
+                layers.push(None);
+                continue;
+            }
             let device = mapper.device_for(layer_idx, false).unwrap_or(device);
 
             let ffn_up = QLinear::new(&mut ct, &format!("{prefix}.ffn_up"), device)?;
@@ -295,7 +299,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let QMatMul::QTensor(out_w) = out.inner_ref().clone() else {
                 unreachable!()
             };
-            layers.push(LayerWeights {
+            layers.push(Some(LayerWeights {
                 attn_qkv: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                     q_weight: qkv_w,
                     b: qkv.bias().cloned(),
@@ -319,7 +323,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     sinks: None,
                 },
                 dtype,
-            })
+            }))
         }
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
@@ -366,6 +370,10 @@ impl ModelWeights {
         let mask = DeviceMappedMask::new(mask, &*self.mapper)?;
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
+            let layer = match layer {
+                Some(l) => l,
+                None => continue,
+            };
             let residual = &xs;
             let xs_norm = xs.apply(&layer.attn_norm)?;
             let attn_outputs = layer.forward_attn(

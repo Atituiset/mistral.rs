@@ -210,7 +210,7 @@ impl LayerWeights {
 
 pub struct ModelWeights {
     tok_embeddings: Embedding,
-    layers: Vec<LayerWeights>,
+    layers: Vec<Option<LayerWeights>>,
     norm: QRmsNorm,
     output: Arc<dyn QuantMethod>,
     pub device: Device,
@@ -268,7 +268,7 @@ impl ModelConfig::FromGGML for ModelWeights {
             let attention_norm = ct.remove(&format!("{prefix}.attention_norm.weight"))?;
             let ffn_norm = ct.remove(&format!("{prefix}.ffn_norm.weight"))?;
             let n_kv_head = ct.hparams.n_head as usize / gqa;
-            layers.push(LayerWeights {
+            layers.push(Some(LayerWeights {
                 attention_wq: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                     q_weight: Arc::new(attention_wq),
                     b: None,
@@ -301,7 +301,7 @@ impl ModelConfig::FromGGML for ModelWeights {
                     sinks: None,
                 },
                 dtype,
-            })
+            }))
         }
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, ct.hparams.n_embd as usize),
@@ -471,7 +471,14 @@ impl ModelConfig::FromGGUF for ModelWeights {
             &new_multi_progress(),
         ) {
             let prefix = format!("blk.{layer_idx}");
-            let device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            if mapper.is_layer_remote(layer_idx) {
+                layers.push(None);
+                continue;
+            }
+            let Some(device) = mapper.device_for(layer_idx, false) else {
+                layers.push(None);
+                continue;
+            };
             let rotary = ropes
                 .get(&device.location())
                 .expect("No RoPE for device location!")
@@ -602,7 +609,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     Some(PagedAttention::new(head_dim, device, None)?)
                 }
             };
-            layers.push(LayerWeights {
+            layers.push(Some(LayerWeights {
                 attention_wq: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                     q_weight: Arc::new(attention_wq),
                     b: None,
@@ -635,7 +642,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     sinks: None,
                 },
                 dtype,
-            })
+            }))
         }
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
@@ -692,6 +699,10 @@ impl ModelWeights {
             if let Some(ref mapper) = self.mapper {
                 layer_in = mapper.map(layer_in, i)?;
             }
+            let layer = match layer {
+                Some(l) => l,
+                None => continue,
+            };
             let x = layer_in;
             let residual = &x;
             let x = layer.attention_norm.forward(&x)?;

@@ -145,7 +145,7 @@ impl LayerWeights {
 
 pub struct ModelWeights {
     tok_embeddings: Embedding,
-    layers: Vec<LayerWeights>,
+    layers: Vec<Option<LayerWeights>>,
     output_norm: RmsNorm,
     output: QMatMul,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
@@ -264,6 +264,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
             &new_multi_progress(),
         ) {
             let prefix = format!("blk.{layer_idx}");
+            if mapper.is_layer_remote(layer_idx) {
+                layers.push(None);
+                continue;
+            }
             let device = mapper.device_for(layer_idx, false).unwrap_or(device);
             let ffn_up =
                 QMatMul::from_qtensor(ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?)?;
@@ -310,7 +314,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let QMatMul::QTensor(out_w) = out.clone() else {
                 unreachable!()
             };
-            layers.push(LayerWeights {
+            layers.push(Some(LayerWeights {
                 attn_qkv: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                     q_weight: qkv_w,
                     b: None,
@@ -336,7 +340,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     sinks: None,
                 },
                 dtype,
-            })
+            }))
         }
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
@@ -392,6 +396,10 @@ impl ModelWeights {
             if let Some(ref mapper) = self.mapper {
                 xs = mapper.map(xs, i)?;
             }
+            let layer = match layer {
+                Some(l) => l,
+                None => continue,
+            };
             let residual = &xs;
             let ys = xs.apply(&layer.attn_norm)?;
             let ys = layer.forward_attn(
