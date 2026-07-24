@@ -234,6 +234,26 @@ pub enum Command {
         #[arg(short, long)]
         yes: bool,
     },
+
+    /// Start a TCP remote worker for cross-machine layered inference
+    #[command(name = "remote-worker")]
+    RemoteWorker {
+        /// Directory containing the GGUF model file
+        #[arg(long, default_value = ".")]
+        model_dir: String,
+
+        /// GGUF model filename
+        #[arg(long)]
+        model_file: String,
+
+        /// Address to listen on (e.g. 0.0.0.0:5050)
+        #[arg(long, default_value = "0.0.0.0:5050")]
+        listen: String,
+
+        /// Layer range to serve (e.g. "10-17")
+        #[arg(long, default_value = "0-0")]
+        layers: String,
+    },
 }
 
 /// Cache management subcommands

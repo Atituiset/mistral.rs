@@ -7,7 +7,7 @@ mod remote;
 pub use mappers::NcclPipelineParallelMapper;
 pub use mappers::{DeviceMapper, DummyDeviceMapper, LayerDeviceMapper, NcclDeviceMapper};
 pub use mask::DeviceMappedMask;
-pub use remote::{RemoteConnectionPool, RemoteLayerMapper};
+pub use remote::{deserialize_tensor, serialize_tensor, RemoteConnectionPool, RemoteLayerMapper};
 
 use std::sync::Arc;
 

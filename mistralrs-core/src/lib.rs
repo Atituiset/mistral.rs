@@ -130,7 +130,8 @@ pub use agent_approval::{
 };
 pub use amoe::{AnyMoeConfig, AnyMoeExpertType};
 pub use device_map::{
-    DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, LayerDeviceMapper,
+    deserialize_tensor, serialize_tensor, DeviceLayerMapMetadata, DeviceMapMetadata,
+    DeviceMapSetting, LayerDeviceMapper,
 };
 pub use files::{
     format_from_name, is_text_mime, mime_for_format, File, FileContent, FileSource, FileStore,
@@ -167,7 +168,7 @@ pub use pipeline::{
     AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, DiffusionGenerationParams, DiffusionLoader,
     DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader, EmbeddingLoaderBuilder,
     EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig, GGMLLoader,
-    GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig,
+    GGMLLoaderBuilder, GGMLSpecificConfig, GGUFPipeline, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig,
     GemmaLoader, Idefics2Loader, IsqOrganization, LLaVALoader, LLaVANextLoader, LlamaLoader,
     Loader, LocalModelPaths, MistralLoader, MixtralLoader, Modalities, ModelKind, ModelPaths,
     MultimodalLoader, MultimodalLoaderBuilder, MultimodalLoaderType, MultimodalPromptPrefixer,

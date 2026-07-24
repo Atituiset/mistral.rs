@@ -11,6 +11,7 @@ mod commands;
 mod config;
 #[cfg(test)]
 mod docgen;
+mod remote_worker;
 mod ui;
 
 use anyhow::Result;
@@ -23,6 +24,7 @@ use commands::{
     run_login, run_quantize, run_server, run_tune, run_uninstall, run_update, run_uqff,
     BenchRunConfig,
 };
+use remote_worker::run_remote_worker;
 use mistralrs_core::{initialize_mistralrs_logging, LogVerbosity};
 
 // Tensor ops allocate fresh output buffers constantly; mimalloc removes the page-fault
@@ -168,9 +170,43 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+
+        Command::RemoteWorker {
+            model_dir,
+            model_file,
+            listen,
+            layers,
+        } => {
+            let (start, end) = parse_layer_range(&layers)?;
+            run_remote_worker(&model_dir, &model_file, &listen, start, end)?;
+        }
     }
 
     Ok(())
+}
+
+fn parse_layer_range(s: &str) -> Result<(usize, usize)> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 2 {
+        anyhow::bail!(
+            "Invalid layer range '{}', expected format: 'start-end' (e.g. '10-17')",
+            s
+        );
+    }
+    let start: usize = parts[0]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid start layer: {}", parts[0]))?;
+    let end: usize = parts[1]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid end layer: {}", parts[1]))?;
+    if end < start {
+        anyhow::bail!(
+            "End layer ({}) must be >= start layer ({})",
+            end,
+            start
+        );
+    }
+    Ok((start, end))
 }
 
 fn init_tracing(verbose: u8) {

@@ -38,7 +38,7 @@ pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder};
 pub(crate) use embedding::EmbeddingLoadContext;
 pub use embedding::{EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingSpecificConfig};
 pub use ggml::{GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig};
-pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
+pub use gguf::{GGUFPipeline, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
 use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
 pub(crate) use isq::IsqModelLoader;
@@ -1830,6 +1830,23 @@ pub trait Pipeline:
     ) -> Result<(), candle_core::Error>;
 
     fn category(&self) -> ModelCategory;
+
+    /// Forward hidden states through a subset of layers. Used by the remote worker
+    /// to process layer ranges received via TCP.
+    fn forward_from_layer(
+        &self,
+        _hidden: &Tensor,
+        _start_layer: usize,
+        _end_layer: usize,
+        _past_kv_len: usize,
+    ) -> Result<Tensor, candle_core::Error> {
+        candle_core::bail!("forward_from_layer not implemented for this pipeline")
+    }
+
+    /// Reset the KV cache. Used by the remote worker on CMD_RESET.
+    fn reset_kv_cache(&self) -> Result<(), candle_core::Error> {
+        candle_core::bail!("reset_kv_cache not implemented for this pipeline")
+    }
 
     /// Return encoder cache hit/miss counters (hits, misses) if this pipeline has an encoder cache.
     fn encoder_cache_counters(&self) -> Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)> {

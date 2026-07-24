@@ -502,4 +502,41 @@ impl ModelWeights {
         let x = extract_logits(&x, context_lens)?;
         self.output.forward(&x.contiguous()?)
     }
+
+    #[allow(clippy::too_many_arguments, dead_code)]
+    pub fn forward_from_layer(
+        &self,
+        hidden: &Tensor,
+        start_layer: usize,
+        end_layer: usize,
+        past_kv_len: usize,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
+        let mut layer_in = hidden.to_device(&self.device)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            if i < start_layer || i > end_layer {
+                continue;
+            }
+            let layer = match layer {
+                Some(l) => l,
+                None => continue,
+            };
+            let x = layer_in;
+            let residual = &x;
+            let x = layer.attention_norm.forward(&x)?;
+            let attn = layer.forward_attn(
+                &x,
+                &AttentionMask::None,
+                &[past_kv_len],
+                &mut cache[i],
+                None,
+            )?;
+            let x = (attn + residual)?;
+            let residual = &x;
+            let x = layer.ffn_norm.forward(&x)?;
+            let x = layer.mlp.forward(&x)?;
+            layer_in = (x + residual)?;
+        }
+        layer_in.to_device(&Device::Cpu)
+    }
 }

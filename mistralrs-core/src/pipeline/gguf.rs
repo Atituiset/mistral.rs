@@ -84,6 +84,25 @@ pub struct GGUFPipeline {
     mapper: Box<dyn DeviceMapper + Send + Sync>,
 }
 
+impl GGUFPipeline {
+    pub fn forward_from_layer(
+        &self,
+        hidden: &candle_core::Tensor,
+        start_layer: usize,
+        end_layer: usize,
+        past_kv_len: usize,
+        cache: &mut [crate::kv_cache::KvCache],
+    ) -> candle_core::Result<candle_core::Tensor> {
+        match &self.model {
+            Model::Llama(m) => m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache),
+            Model::Qwen(m) => m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache),
+            Model::Qwen3(m) => m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache),
+            Model::Qwen3MoE(m) => m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache),
+            _ => candle_core::bail!("forward_from_layer not implemented for this architecture"),
+        }
+    }
+}
+
 /// Loader for a GGUF model.
 pub struct GGUFLoader {
     model_id: Option<String>,
@@ -831,6 +850,25 @@ impl Pipeline for GGUFPipeline {
     }
     fn category(&self) -> ModelCategory {
         ModelCategory::Text
+    }
+
+    fn forward_from_layer(
+        &self,
+        hidden: &Tensor,
+        start_layer: usize,
+        end_layer: usize,
+        past_kv_len: usize,
+    ) -> candle_core::Result<Tensor> {
+        let mut cache_guard = self.cache().normal();
+        self.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, &mut cache_guard.0)
+    }
+
+    fn reset_kv_cache(&self) -> candle_core::Result<()> {
+        let mut cache_guard = self.cache().normal();
+        for kv in cache_guard.0.iter_mut() {
+            kv.reset();
+        }
+        Ok(())
     }
 }
 
