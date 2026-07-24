@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,9 +58,10 @@ impl RemoteConnectionPool {
         cmd: u8,
         layer_start: u32,
         layer_end: u32,
+        past_kv: u32,
         payload: &[u8],
     ) -> Result<Vec<u8>> {
-        eprintln!("[BRIDGE] roundtrip: addr={addr} cmd={cmd} layers={layer_start}-{layer_end} payload_len={}", payload.len());
+        eprintln!("[BRIDGE] roundtrip: addr={addr} cmd={cmd} layers={layer_start}-{layer_end} past_kv={past_kv} payload_len={}", payload.len());
         let mut guard = self
             .connections
             .get(addr)
@@ -82,7 +83,6 @@ impl RemoteConnectionPool {
             stream
                 .write_all(&layer_end.to_le_bytes())
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-            let past_kv: u32 = 0; // KV cache offset, 0 for first forward
             stream
                 .write_all(&past_kv.to_le_bytes())
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
@@ -116,10 +116,10 @@ impl RemoteConnectionPool {
 
         match try_op(&mut guard) {
             Ok(resp) => Ok(resp),
-            Err(e) => {
+            Err(_e) => {
                 // Attempt reconnection on failure
                 info!("Remote connection to {addr} lost, reconnecting...");
-                match TcpStream::connect(addr.clone()) {
+                match TcpStream::connect(addr) {
                     Ok(new_stream) => {
                         let _ = new_stream.set_nodelay(true);
                         let _ = new_stream.set_read_timeout(Some(Duration::from_secs(300)));
@@ -201,6 +201,8 @@ pub struct RemoteLayerMapper {
     /// forward loop already has the output of the preceding layer.
     /// usize::MAX means "none".
     last_remote_block: AtomicUsize,
+    /// KV cache position for the current forward pass, set via `set_past_kv()`.
+    past_kv: AtomicU32,
 }
 
 impl RemoteLayerMapper {
@@ -246,6 +248,7 @@ impl RemoteLayerMapper {
             remote_blocks,
             layer_to_block,
             last_remote_block: AtomicUsize::new(usize::MAX),
+            past_kv: AtomicU32::new(0),
         }
     }
 }
@@ -263,7 +266,7 @@ impl DeviceMapper for RemoteLayerMapper {
     fn map(&self, input: Tensor, layer: usize) -> Result<Tensor> {
         match self.layer_specs.get(layer) {
             Some(RemoteAwareDevice::Local(_)) => self.local_mapper.map(input, layer),
-            Some(RemoteAwareDevice::Remote { addr: _ }) => {
+            Some(RemoteAwareDevice::Remote { .. }) => {
                 let block_idx = self.layer_to_block[layer].unwrap();
                 let (addr, start, end) = &self.remote_blocks[block_idx];
 
@@ -275,9 +278,10 @@ impl DeviceMapper for RemoteLayerMapper {
 
                 eprintln!("[BRIDGE] map: layer={layer} remote={addr}");
                 let payload = serialize_tensor(&input)?;
+                let past_kv = self.past_kv.load(std::sync::atomic::Ordering::Relaxed);
                 let resp = self
                     .connection_pool
-                    .roundtrip(addr, 0x00, *start as u32, *end as u32, &payload)?;
+                    .roundtrip(addr, 0x00, *start as u32, *end as u32, past_kv, &payload)?;
                 self.last_remote_block
                     .store(block_idx, std::sync::atomic::Ordering::Relaxed);
                 deserialize_tensor(&resp, &Device::Cpu)
@@ -355,5 +359,9 @@ impl DeviceMapper for RemoteLayerMapper {
         self.layer_specs
             .get(layer)
             .is_some_and(|d| d.is_remote())
+    }
+
+    fn set_past_kv(&self, past_kv: u32) {
+        self.past_kv.store(past_kv, std::sync::atomic::Ordering::Relaxed);
     }
 }

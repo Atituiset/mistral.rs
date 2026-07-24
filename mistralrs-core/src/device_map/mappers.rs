@@ -29,6 +29,10 @@ pub trait DeviceMapper: Debug {
     fn is_layer_remote(&self, _layer: usize) -> bool {
         false
     }
+
+    /// Set the current KV cache position for the upcoming forward pass.
+    /// Only meaningful for remote-layer mappers that send hidden states over TCP.
+    fn set_past_kv(&self, _past_kv: u32) {}
 }
 
 #[derive(Debug)]

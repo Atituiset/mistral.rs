@@ -465,6 +465,10 @@ impl ModelWeights {
         } else {
             DeviceMappedMask::from_single(mask)
         };
+        if let Some(ref mapper) = self.mapper {
+            let past_kv = start_offsets.first().copied().unwrap_or(0) as u32;
+            mapper.set_past_kv(past_kv);
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(ref mapper) = self.mapper {
                 layer_in = mapper.map(layer_in, i)?;
