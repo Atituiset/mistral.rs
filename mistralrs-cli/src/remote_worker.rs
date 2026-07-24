@@ -75,97 +75,120 @@ pub fn run_remote_worker(
 
     println!("Model loaded successfully");
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
     let listener =
         TcpListener::bind(listen_addr).context(format!("Failed to bind to {listen_addr}"))?;
+    println!("Listening on {listen_addr}");
 
-    loop {
-        println!("Waiting for connection...");
-        let (mut stream, addr) = listener.accept()?;
+    // Accept connections and spawn a thread for each one.
+    // The pipeline (model) is shared via Arc; each handler uses try_lock().
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                continue;
+            }
+        };
+        let addr = match stream.peer_addr() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
         println!("Connected from {addr}");
         stream.set_nodelay(true)?;
 
-        loop {
-            let mut cmd = [0u8; 1];
-            if stream.read_exact(&mut cmd).is_err() {
-                break;
-            }
+        let pipeline = Arc::clone(&pipeline);
 
-            let mut header = [0u8; 16];
-            if stream.read_exact(&mut header).is_err() {
-                break;
-            }
-            let layer_start = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-            let layer_end = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-            let past_kv = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+        std::thread::spawn(move || {
+            loop {
+                let mut cmd = [0u8; 1];
+                if stream.read_exact(&mut cmd).is_err() {
+                    break;
+                }
 
-            let mut len_buf = [0u8; 8];
-            if stream.read_exact(&mut len_buf).is_err() {
-                break;
-            }
-            let payload_len = u64::from_le_bytes(len_buf) as usize;
+                let mut header = [0u8; 16];
+                if stream.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let layer_start = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+                let layer_end = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+                let past_kv = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
 
-            let mut payload = vec![0u8; payload_len];
-            if stream.read_exact(&mut payload).is_err() {
-                break;
-            }
+                let mut len_buf = [0u8; 8];
+                if stream.read_exact(&mut len_buf).is_err() {
+                    break;
+                }
+                let payload_len = u64::from_le_bytes(len_buf) as usize;
 
-            match cmd[0] {
-                CMD_COMPUTE => {
-                    let hidden = match deserialize_tensor(&payload, &Device::Cpu) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            eprintln!("Failed to deserialize tensor: {e}");
-                            break;
-                        }
-                    };
+                let mut payload = vec![0u8; payload_len];
+                if stream.read_exact(&mut payload).is_err() {
+                    break;
+                }
 
-                    let result = rt.block_on(async {
-                        let pipeline = pipeline.lock().await;
-                        pipeline.forward_from_layer(&hidden, layer_start, layer_end, past_kv)
-                    });
+                match cmd[0] {
+                    CMD_COMPUTE => {
+                        let hidden = match deserialize_tensor(&payload, &Device::Cpu) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                eprintln!("[{addr}] deserialize error: {e}");
+                                break;
+                            }
+                        };
 
-                    match result {
-                        Ok(output) => {
-                            let resp = match serialize_tensor(&output) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    eprintln!("Failed to serialize tensor: {e}");
+                        let result = {
+                            let pipeline = match pipeline.try_lock() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    eprintln!("[{addr}] pipeline lock failed");
                                     break;
                                 }
                             };
-                            if stream.write_all(&(resp.len() as u64).to_le_bytes()).is_err() {
+                            pipeline.forward_from_layer(&hidden, layer_start, layer_end, past_kv)
+                        };
+
+                        match result {
+                            Ok(output) => {
+                                let resp = match serialize_tensor(&output) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        eprintln!("[{addr}] serialize error: {e}");
+                                        break;
+                                    }
+                                };
+                                if stream.write_all(&(resp.len() as u64).to_le_bytes()).is_err() {
+                                    break;
+                                }
+                                if stream.write_all(&resp).is_err() {
+                                    break;
+                                }
+                                if stream.flush().is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[{addr}] forward_from_layer error: {e}");
                                 break;
                             }
-                            if stream.write_all(&resp).is_err() {
-                                break;
-                            }
-                            if stream.flush().is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("forward_from_layer error: {e}");
-                            break;
                         }
                     }
-                }
-                CMD_RESET => {
-                    rt.block_on(async {
-                        let pipeline = pipeline.lock().await;
-                        if let Err(e) = pipeline.reset_kv_cache() {
-                            eprintln!("reset_kv_cache error: {e}");
+                    CMD_RESET => {
+                        match pipeline.try_lock() {
+                            Ok(pipeline) => {
+                                if let Err(e) = pipeline.reset_kv_cache() {
+                                    eprintln!("[{addr}] reset_kv_cache error: {e}");
+                                }
+                            }
+                            Err(_) => {
+                                eprintln!("[{addr}] pipeline lock failed for reset");
+                            }
                         }
-                    });
-                    println!("KV cache reset");
+                        println!("[{addr}] KV cache reset");
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
-        }
-
-        println!("Connection from {addr} closed");
+            println!("Connection from {addr} closed");
+        });
     }
+    #[allow(unreachable_code)]
+    Ok(())
 }

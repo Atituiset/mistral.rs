@@ -396,12 +396,7 @@ impl Loader for GGUFLoader {
             device_map::get_all_similar_devices(device)?
         };
 
-        let pipeline_mapper = mapper.into_mapper(
-            num_layers,
-            device,
-            self.config.topology.as_ref(),
-            &available_devices,
-        )?;
+        let mapper_setting = mapper.clone();
         let mapper = mapper.into_mapper(
             num_layers,
             device,
@@ -597,6 +592,12 @@ impl Loader for GGUFLoader {
             .as_ref()
             .and_then(GenerationConfig::generation_defaults);
         let eos = calculate_eos_tokens(&chat_template, gen_conf.as_ref(), &tokenizer);
+        let pipeline_mapper = mapper_setting.into_mapper(
+            num_layers,
+            device,
+            self.config.topology.as_ref(),
+            &available_devices,
+        )?;
         Ok(Arc::new(Mutex::new(GGUFPipeline {
             model,
             tokenizer: tokenizer.into(),
