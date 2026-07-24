@@ -163,8 +163,19 @@ impl DeviceMapMetadata {
             let local_mappings: Vec<Device> = layer_specs
                 .iter()
                 .map(|d| match d {
-                    crate::topology::RemoteAwareDevice::Local(dev) => dev.clone(),
-                    crate::topology::RemoteAwareDevice::Remote { .. } => Device::Cpu,
+                    crate::topology::RemoteAwareDevice::Local(dev) => {
+                        // Canonicalize: use the default device's DeviceId when
+                        // the ordinal matches, so that same_device() comparisons
+                        // in CUDA kernels (e.g. RoPE) don't fail.
+                        if dev.location() == device.location() {
+                            device.clone()
+                        } else {
+                            dev.clone()
+                        }
+                    }
+                    // Remote layers are handled by RemoteLayerMapper; use the
+                    // default device here to keep get_unique_devices() clean.
+                    crate::topology::RemoteAwareDevice::Remote { .. } => device.clone(),
                 })
                 .collect();
 

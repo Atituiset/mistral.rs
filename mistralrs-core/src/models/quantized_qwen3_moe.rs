@@ -371,14 +371,19 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         let mut ropes = HashMap::new();
         for layer_idx in 0..block_count {
-            let device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            let layer_dev = mapper.device_for(layer_idx, false).unwrap_or(device);
+            let rope_dev: &Device = if layer_dev.location() == device.location() {
+                device
+            } else {
+                layer_dev
+            };
             ropes.insert(
-                device.location(),
+                rope_dev.location(),
                 Arc::new(RotaryEmbedding::new(
                     rope_freq_base,
                     head_dim,
                     max_seq_len,
-                    device,
+                    rope_dev,
                     true,
                     DType::F32,
                 )?),
