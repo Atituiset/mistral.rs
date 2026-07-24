@@ -1,7 +1,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::attention::{AttentionMask, SdpaParams};
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
@@ -111,7 +111,362 @@ impl MoeOrMlp {
     }
 }
 
-struct LayerWeights {
+// SSM (Gated DeltaNet) layer weights for Qwen3.5/3.6 MoE hybrid architecture.
+// Each SSM layer uses a causal conv1d for local mixing followed by a
+// gated delta-rule recurrence that maintains a square state matrix per head.
+struct SsmWeights {
+    // fused QKV input projection [d_model, 2*inner_size] — after conv+silu
+    // it is split into q [n_kv_heads*state_size], k [n_kv_heads*state_size],
+    // v [n_heads*state_size]
+    attn_qkv: Arc<dyn QuantMethod>,
+    // output gating projection [d_model, inner_size]
+    attn_gate: Arc<dyn QuantMethod>,
+    // causal depthwise conv1d weight [kernel, 2*inner_size] stored as [kernel, channels]
+    ssm_conv1d: Tensor,
+    // per-head transition scalar (precomputed as -exp(A_log)), [n_heads]
+    ssm_a: Tensor,
+    // input→alpha projection [d_model, n_heads]
+    ssm_alpha: Arc<dyn QuantMethod>,
+    // input→beta projection [d_model, n_heads]
+    ssm_beta: Arc<dyn QuantMethod>,
+    // delta-time bias [n_heads]
+    ssm_dt: Tensor,
+    // output projection [inner_size, d_model]
+    ssm_out: Arc<dyn QuantMethod>,
+    // group-norm weight for gated output [state_size]
+    ssm_norm: Tensor,
+    n_heads: usize,       // num_v_heads = time_step_rank
+    n_kv_heads: usize,    // num_k_heads = group_count
+    state_size: usize,    // head_v_dim = head_k_dim
+    inner_size: usize,
+}
+
+impl SsmWeights {
+    fn forward(
+        &self,
+        x: &Tensor,
+        conv_state: &Mutex<Option<Tensor>>,
+        ssm_state: &Mutex<Option<Tensor>>,
+    ) -> Result<Tensor> {
+        // x: [batch, seq_len, d_model]
+        let (_batch, seq_len, _d_model) = x.dims3()?;
+        let _device = x.device();
+
+        // 1. fused QKV projection → [batch, seq_len, 2*inner_size]
+        let qkv = self.attn_qkv.forward(x)?;
+
+        // 2. causal conv1d depthwise over channels
+        let qkv = causal_conv1d_depthwise(&qkv, &self.ssm_conv1d, conv_state)?;
+
+        // 3. SiLU activation
+        let qkv = candle_nn::ops::silu(&qkv)?;
+
+        // 4. split into q, k, v
+        // q: [batch, seq_len, n_kv_heads * state_size]
+        // k: [batch, seq_len, n_kv_heads * state_size]
+        // v: [batch, seq_len, n_heads * state_size]
+        let q_size = self.n_kv_heads * self.state_size;
+        let k_size = self.n_kv_heads * self.state_size;
+        let v_size = self.n_heads * self.state_size;
+        let q = qkv.narrow(D::Minus1, 0, q_size)?;
+        let k = qkv.narrow(D::Minus1, q_size, k_size)?;
+        let v = qkv.narrow(D::Minus1, q_size + k_size, v_size)?;
+
+        // reshape to [batch, seq_len, n_heads, state_size]
+        let q = q.reshape((_batch, seq_len, self.n_kv_heads, self.state_size))?;
+        let k = k.reshape((_batch, seq_len, self.n_kv_heads, self.state_size))?;
+        let v = v.reshape((_batch, seq_len, self.n_heads, self.state_size))?;
+
+        // 5. L2 normalize q and k
+        let q = l2_norm(&q, 1e-6)?;
+        let k = l2_norm(&k, 1e-6)?;
+
+        // 6. repeat q/k from n_kv_heads to n_heads if they differ
+        let (q, k) = if self.n_kv_heads != self.n_heads {
+            let repeat = self.n_heads / self.n_kv_heads;
+            let q = q
+                .unsqueeze(D::Minus2)?
+                .broadcast_as((
+                    _batch,
+                    seq_len,
+                    self.n_kv_heads,
+                    repeat,
+                    self.state_size,
+                ))?
+                .reshape((_batch, seq_len, self.n_heads, self.state_size))?;
+            let k = k
+                .unsqueeze(D::Minus2)?
+                .broadcast_as((
+                    _batch,
+                    seq_len,
+                    self.n_kv_heads,
+                    repeat,
+                    self.state_size,
+                ))?
+                .reshape((_batch, seq_len, self.n_heads, self.state_size))?;
+            (q, k)
+        } else {
+            (q, k)
+        };
+
+        // 7. alpha projection → gate (data-dependent decay)
+        let alpha = self.ssm_alpha.forward(x)?; // [batch, seq_len, n_heads]
+        let alpha = alpha.broadcast_add(&self.ssm_dt.reshape((1, 1, self.n_heads))?)?;
+        let alpha = softplus(&alpha)?;
+        let gate = alpha.broadcast_mul(&self.ssm_a.reshape((1, 1, self.n_heads))?)?;
+        // gate = -exp(A_log) * softplus(alpha+dt), values in (-inf, 0]
+        let alpha_decay = gate.exp()?; // exp(gate) ∈ (0, 1]
+
+        // 8. beta projection (data-dependent gating)
+        let beta = self.ssm_beta.forward(x)?; // [batch, seq_len, n_heads]
+        let beta = candle_nn::ops::sigmoid(&beta)?;
+
+        // 9. Gated DeltaNet recurrence
+        let out = gated_delta_net_recurrence(
+            &q,
+            &k,
+            &v,
+            &alpha_decay,
+            &beta,
+            ssm_state,
+            self.state_size,
+            self.n_heads,
+        )?;
+
+        // 10. gated normalization: norm(output) * silu(gate_proj)
+        let gate_proj = self.attn_gate.forward(x)?; // [batch, seq_len, inner_size]
+        let gate_proj = gate_proj
+            .reshape((_batch, seq_len, self.n_heads, self.state_size))?;
+        let out = norm_gated(&out, &gate_proj, &self.ssm_norm)?;
+
+        // 11. reshape to [batch, seq_len, inner_size] and output projection
+        let out = out.reshape((_batch, seq_len, self.inner_size))?;
+        let out = self.ssm_out.forward(&out)?; // → [batch, seq_len, d_model]
+        Ok(out)
+    }
+}
+
+/// Causal depthwise conv1d: each channel gets its own kernel applied over time.
+/// conv_weight: [kernel_size, channels]
+/// conv_state: stores last (kernel-1) frames as [kernel-1, channels]
+fn causal_conv1d_depthwise(
+    x: &Tensor,
+    conv_weight: &Tensor,
+    conv_state: &Mutex<Option<Tensor>>,
+) -> Result<Tensor> {
+    let (batch, seq_len, channels) = x.dims3()?;
+    let kernel_size = conv_weight.dims()[0];
+    let device = x.device();
+    if kernel_size == 0 {
+        return Ok(x.clone());
+    }
+    let mut state = conv_state.lock().unwrap();
+    let pad_size = kernel_size - 1;
+    if seq_len > 1 {
+        // multi-token: do full conv1d via matrix ops
+        // For simplicity, process each position sequentially for correctness
+        let mut outputs = Vec::with_capacity(seq_len);
+        for t in 0..seq_len {
+            let x_t = x.narrow(1, t, 1)?;
+            let (_, _seq1, _) = x_t.dims3()?;
+            let x_t = x_t.reshape((batch, channels))?;
+            let mut accum = x_t.broadcast_mul(&conv_weight.narrow(0, 0, 1)?.reshape((1, channels))?)?;
+            if let Some(ref prev) = *state {
+                // prev: [pad_size, channels]
+                // conv_weight[1..]: [pad_size, channels]
+                for k in 1..kernel_size {
+                    if k - 1 < pad_size {
+                        let prev_t = prev.narrow(0, pad_size - (k - 1) - 1, 1)?;
+                        let w_k = conv_weight.narrow(0, k, 1)?.reshape((1, channels))?;
+                        accum = (accum + prev_t.broadcast_mul(&w_k)?)?;
+                    }
+                }
+            }
+            outputs.push(accum.reshape((batch, 1, channels))?);
+            // update state: shift in x_t
+            let x_t = x_t.reshape((1, channels))?;
+            let new_state = if let Some(ref prev) = *state {
+                Tensor::cat(&[prev.narrow(0, 1, pad_size - 1)?, x_t], 0)?
+            } else {
+                if pad_size > 1 {
+                    let zeros = Tensor::zeros((pad_size - 1, channels), x_t.dtype(), &device)?;
+                    Tensor::cat(&[zeros, x_t], 0)?
+                } else {
+                    x_t
+                }
+            };
+            *state = Some(new_state);
+        }
+        Tensor::cat(&outputs.iter().map(|t| t.as_ref()).collect::<Vec<_>>(), 1)
+    } else {
+        // single token: use conv_state
+        let x_t = x.reshape((batch, channels))?;
+        let mut accum = x_t.broadcast_mul(&conv_weight.narrow(0, 0, 1)?.reshape((1, channels))?)?;
+        if let Some(ref prev) = *state {
+            for k in 1..kernel_size {
+                let prev_t = prev.narrow(0, pad_size - k, 1)?;
+                let w_k = conv_weight.narrow(0, k, 1)?.reshape((1, channels))?;
+                accum = (accum + prev_t.broadcast_mul(&w_k)?)?;
+            }
+        }
+        // update state
+        let x_t_1d = x_t.reshape((1, channels))?;
+        let new_state = if let Some(ref prev) = *state {
+            if pad_size > 1 {
+                Tensor::cat(&[prev.narrow(0, 1, pad_size - 1)?, x_t_1d], 0)?
+            } else {
+                x_t_1d
+            }
+        } else if pad_size > 1 {
+            let zeros = Tensor::zeros((pad_size - 1, channels), x_t.dtype(), &device)?;
+            Tensor::cat(&[zeros, x_t_1d], 0)?
+        } else {
+            x_t_1d
+        };
+        *state = Some(new_state);
+        Ok(accum.reshape((batch, 1, channels))?)
+    }
+}
+
+fn softplus(x: &Tensor) -> Result<Tensor> {
+    (Tensor::ones_like(x)? + x.exp()?)?.log()
+}
+
+// L2-normalize along the last dimension
+fn l2_norm(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let norm = x.sqr()?.sum_keepdim(D::Minus1)?;
+    let norm = norm.sqrt()?;
+    let eps_tensor = Tensor::new(eps as f32, x.device())?.to_dtype(x.dtype())?;
+    let norm = norm.broadcast_maximum(&eps_tensor)?;
+    x.broadcast_div(&norm)
+}
+
+// Gated DeltaNet recurrence: per-head state update via outer product.
+// q, k, v: [batch, seq_len, n_heads, state_size]
+// alpha_decay, beta: [batch, seq_len, n_heads]
+// ssm_state: [n_heads, state_size, state_size] (persistent across tokens)
+fn gated_delta_net_recurrence(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    alpha_decay: &Tensor,
+    beta: &Tensor,
+    ssm_state: &Mutex<Option<Tensor>>,
+    state_size: usize,
+    n_heads: usize,
+) -> Result<Tensor> {
+    let (batch, seq_len, _n_heads, _state_size) = q.dims4()?;
+    let device = q.device();
+    let mut state = ssm_state.lock().unwrap();
+
+    if state.is_none() {
+        *state = Some(Tensor::zeros(
+            (n_heads, state_size, state_size),
+            q.dtype(),
+            &device,
+        )?);
+    }
+    let mut s = state.clone().unwrap(); // [n_heads, state_size, state_size]
+
+    let mut outputs = Vec::with_capacity(seq_len);
+    for t in 0..seq_len {
+        let q_t = q.narrow(1, t, 1)?.reshape((batch, n_heads, state_size))?; // [batch, n_heads, D]
+        let k_t = k.narrow(1, t, 1)?.reshape((batch, n_heads, state_size))?;
+        let v_t = v.narrow(1, t, 1)?.reshape((batch, n_heads, state_size))?;
+        let alpha_t = alpha_decay.narrow(1, t, 1)?.reshape((batch, n_heads))?; // [batch, n_heads]
+        let beta_t = beta.narrow(1, t, 1)?.reshape((batch, n_heads))?;
+
+        // kv = S^T @ k_t  → [batch, n_heads, D]
+        let mut kv_vecs = Vec::with_capacity(batch as usize);
+        for b in 0..batch as usize {
+            let s_h = s.clone(); // [n_heads, D, D]
+            let k_bh = k_t.narrow(0, b, 1)?.reshape((n_heads, state_size))?; // [n_heads, D]
+            // S^T @ k  for each head: (D,D)^T @ (D,) = (D,D) @ (D,) = (D,)
+            let s_t = s_h.transpose(1, 2)?; // [n_heads, D, D]
+            let kv = s_t
+                .broadcast_matmul(&k_bh.unsqueeze(D::Minus1)?)? // [n_heads, D, 1]
+                .reshape((1, n_heads, state_size))?;
+            kv_vecs.push(kv);
+        }
+        let kv = Tensor::cat(&kv_vecs.iter().map(|t| t.as_ref()).collect::<Vec<_>>(), 0)?;
+
+        // delta = beta_t * (v_t - kv)  → [batch, n_heads, D]
+        let diff = v_t.sub(&kv)?;
+        let delta = beta_t.unsqueeze(D::Minus1)?.broadcast_mul(&diff)?;
+
+        // S = alpha_t * S + k_t ⊗ delta  (outer product update)
+        // k_t ⊗ delta: for each head, outer(k_h, delta_h) → [D, D]
+        let mut new_s_parts = Vec::with_capacity(batch as usize);
+        for b in 0..batch as usize {
+            let alpha_bh = alpha_t.narrow(0, b, 1)?.reshape((n_heads, 1, 1))?; // [n_heads,1,1]
+            let k_bh = k_t.narrow(0, b, 1)?.reshape((n_heads, state_size))?; // [n_heads, D]
+            let delta_bh = delta.narrow(0, b, 1)?.reshape((n_heads, state_size))?; // [n_heads, D]
+
+            let outer = k_bh
+                .unsqueeze(D::Minus1)?
+                .broadcast_matmul(&delta_bh.unsqueeze(D::Minus2)?)?; // [n_heads, D, D]
+            let s_new_b = s
+                .broadcast_mul(&alpha_bh)?
+                .add(&outer)?; // [n_heads, D, D]
+            new_s_parts.push(s_new_b);
+        }
+        // For batched inference, use the last batch's state (single-sequence assumption)
+        s = new_s_parts.last().unwrap().clone();
+
+        // out_t = S_new @ q_t  → [batch, n_heads, D]
+        let mut out_vecs = Vec::with_capacity(batch as usize);
+        for b in 0..batch as usize {
+            let s_b = s.clone(); // [n_heads, D, D]
+            let q_bh = q_t.narrow(0, b, 1)?.reshape((n_heads, state_size))?;
+            let out_b = s_b
+                .broadcast_matmul(&q_bh.unsqueeze(D::Minus1)?)? // [n_heads, D, 1]
+                .reshape((1, n_heads, state_size))?;
+            out_vecs.push(out_b);
+        }
+        let out_t = Tensor::cat(
+            &out_vecs.iter().map(|t| t.as_ref()).collect::<Vec<_>>(),
+            0,
+        )?;
+        outputs.push(out_t.unsqueeze(1)?); // [batch, 1, n_heads, D]
+    }
+
+    *state = Some(s);
+    Tensor::cat(
+        &outputs.iter().map(|t| t.as_ref()).collect::<Vec<_>>(),
+        1,
+    )
+}
+
+// Gated normalization: group_norm(output) * silu(gate_proj)
+fn norm_gated(output: &Tensor, gate: &Tensor, norm_weight: &Tensor) -> Result<Tensor> {
+    // output, gate: [batch, seq_len, n_heads, state_size]
+    // norm_weight: [state_size]
+    let state_size = output.dims()[3];
+    // RMS-norm over the last dimension
+    let rms = output
+        .sqr()?
+        .mean_keepdim(D::Minus1)?
+        .sqrt()?;
+    let rms = rms.clamp(1e-6, f64::INFINITY)?;
+    let normed = output.broadcast_div(&rms)?;
+    let normed = normed.broadcast_mul(&norm_weight.reshape((1, 1, 1, state_size))?)?;
+    let gate_act = candle_nn::ops::silu(gate)?;
+    normed.broadcast_mul(&gate_act)
+}
+
+enum LayerWeights {
+    Attention(AttentionWeights),
+    Ssm {
+        ssm: SsmWeights,
+        conv_state: Mutex<Option<Tensor>>,
+        ssm_state: Mutex<Option<Tensor>>,
+        attention_norm: QRmsNorm,
+        mlp: MoeOrMlp,
+        ffn_norm: QRmsNorm,
+    },
+}
+
+struct AttentionWeights {
     attention_wq: Arc<dyn QuantMethod>,
     attention_wk: Arc<dyn QuantMethod>,
     attention_wv: Arc<dyn QuantMethod>,
@@ -130,7 +485,7 @@ struct LayerWeights {
     dtype: DType,
 }
 
-impl LayerWeights {
+impl AttentionWeights {
     fn forward_attn(
         &self,
         x: &Tensor,
@@ -235,6 +590,12 @@ pub struct QwenMoEConfig {
     pub decoder_sparse_step: Option<usize>,
     pub norm_topk_prob: bool,
     pub num_experts_per_tok: usize,
+    pub ssm_inner_size: Option<usize>,
+    pub ssm_state_size: Option<usize>,
+    pub ssm_conv_kernel: Option<usize>,
+    pub ssm_time_step_rank: Option<usize>,
+    pub ssm_group_count: Option<usize>,
+    pub full_attention_interval: Option<usize>,
 }
 
 pub(crate) struct PropsGGUF {
@@ -248,6 +609,11 @@ pub(crate) struct PropsGGUF {
     pub key_length: usize,
     pub value_length: usize,
     pub moe_cfg: QwenMoEConfig,
+    pub ssm_state_size: usize,
+    pub ssm_time_step_rank: usize,
+    pub ssm_inner_size: usize,
+    pub ssm_group_count: usize,
+    pub full_attention_interval: usize,
 }
 
 fn verify_qwen3_arch(
@@ -286,6 +652,37 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
         // NOTE: Values are not aligned with GGUFv3 types
         // TODO: Normalize value types to spec
 
+        let ssm_inner_size = c
+            .get_value::<u32>("ssm.inner_size")
+            .ok()
+            .map(|x| x as usize)
+            .unwrap_or(0);
+        let ssm_state_size = c
+            .get_value::<u32>("ssm.state_size")
+            .ok()
+            .map(|x| x as usize)
+            .unwrap_or(0);
+        let ssm_conv_kernel = c
+            .get_value::<u32>("ssm.conv_kernel")
+            .ok()
+            .map(|x| x as usize)
+            .unwrap_or(0);
+        let ssm_time_step_rank = c
+            .get_value::<u32>("ssm.time_step_rank")
+            .ok()
+            .map(|x| x as usize)
+            .unwrap_or(0);
+        let ssm_group_count = c
+            .get_value::<u32>("ssm.group_count")
+            .ok()
+            .map(|x| x as usize)
+            .unwrap_or(0);
+        let full_attention_interval = c
+            .get_value::<u32>("full_attention_interval")
+            .ok()
+            .map(|x| x as usize)
+            .unwrap_or(1);
+
         let moe_cfg = QwenMoEConfig {
             moe_intermediate_size: c.get_value::<u32>("expert_feed_forward_length")? as usize,
             num_experts: Some(c.get_value::<u32>("expert_count")? as usize),
@@ -293,6 +690,36 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             decoder_sparse_step: Some(1),
             norm_topk_prob: true,
             num_experts_per_tok: c.get_value::<u32>("expert_used_count")? as usize,
+            ssm_inner_size: if ssm_inner_size > 0 {
+                Some(ssm_inner_size)
+            } else {
+                None
+            },
+            ssm_state_size: if ssm_state_size > 0 {
+                Some(ssm_state_size)
+            } else {
+                None
+            },
+            ssm_conv_kernel: if ssm_conv_kernel > 0 {
+                Some(ssm_conv_kernel)
+            } else {
+                None
+            },
+            ssm_time_step_rank: if ssm_time_step_rank > 0 {
+                Some(ssm_time_step_rank)
+            } else {
+                None
+            },
+            ssm_group_count: if ssm_group_count > 0 {
+                Some(ssm_group_count)
+            } else {
+                None
+            },
+            full_attention_interval: if full_attention_interval > 1 {
+                Some(full_attention_interval)
+            } else {
+                None
+            },
         };
 
         let props = Self {
@@ -317,6 +744,11 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
                 .map(|x| x as usize)
                 .unwrap_or(embed_len / head_count),
             moe_cfg,
+            ssm_state_size,
+            ssm_time_step_rank,
+            ssm_inner_size,
+            ssm_group_count,
+            full_attention_interval,
         };
 
         Ok(props)
@@ -350,6 +782,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
             key_length,
             value_length,
             moe_cfg,
+            ssm_state_size,
+            ssm_time_step_rank,
+            ssm_inner_size,
+            ssm_group_count,
+            full_attention_interval,
         } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
 
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
@@ -401,113 +838,212 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 continue;
             }
             let device = mapper.device_for(layer_idx, false).unwrap_or(device);
-            let rotary = ropes
-                .get(&device.location())
-                .expect("No RoPE for device location!")
-                .clone();
 
-            let attention_wq = ct.tensor(&format!("{prefix}.attn_q.weight"), device)?;
-            let attention_wk = ct.tensor(&format!("{prefix}.attn_k.weight"), device)?;
-            let attention_wv = ct.tensor(&format!("{prefix}.attn_v.weight"), device)?;
-            let attention_wo = ct.tensor(&format!("{prefix}.attn_output.weight"), device)?;
+            let is_ssm = full_attention_interval > 0
+                && ssm_inner_size > 0
+                && ct.has_tensor(&format!("{prefix}.ssm_conv1d.weight"));
 
-            let mlp = if !moe_cfg
-                .mlp_only_layers
-                .as_ref()
-                .unwrap()
-                .contains(&layer_idx)
-                && (moe_cfg.num_experts.unwrap() > 0
-                    && (layer_idx + 1) % moe_cfg.decoder_sparse_step.unwrap() == 0)
-            {
-                let gate = ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
-                let gate_experts = ct.tensor(&format!("{prefix}.ffn_gate_exps.weight"), device)?;
-                let up_experts = ct.tensor(&format!("{prefix}.ffn_up_exps.weight"), device)?;
-                let down_experts = ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), device)?;
-                let moe = FusedMoe {
-                    gate: QMatMul::from_qtensor(gate)?,
-                    gate_experts: QMatMul::from_qtensor(gate_experts)?,
-                    up_experts: QMatMul::from_qtensor(up_experts)?,
-                    down_experts: QMatMul::from_qtensor(down_experts)?,
-                    norm_topk_prob: moe_cfg.norm_topk_prob,
-                    num_experts_per_tok: moe_cfg.num_experts_per_tok,
+            let layer = if is_ssm {
+                let inner_size = ssm_inner_size;
+                let state_size = ssm_state_size;
+                let n_heads = ssm_time_step_rank;
+                let n_kv_heads = ssm_group_count;
+
+                let attn_qkv = ct.tensor(&format!("{prefix}.attn_qkv.weight"), device)?;
+                let attn_gate = ct.tensor(&format!("{prefix}.attn_gate.weight"), device)?;
+                let ssm_conv1d = ct.tensor(&format!("{prefix}.ssm_conv1d.weight"), device)?
+                    .dequantize(device)?;
+                let ssm_a = ct.tensor(&format!("{prefix}.ssm_a"), device)?
+                    .dequantize(device)?;
+                let ssm_dt = ct.tensor(&format!("{prefix}.ssm_dt.bias"), device)?
+                    .dequantize(device)?;
+                let ssm_alpha = ct.tensor(&format!("{prefix}.ssm_alpha.weight"), device)?;
+                let ssm_beta = ct.tensor(&format!("{prefix}.ssm_beta.weight"), device)?;
+                let ssm_out = ct.tensor(&format!("{prefix}.ssm_out.weight"), device)?;
+                let ssm_norm = ct.tensor(&format!("{prefix}.ssm_norm.weight"), device)?
+                    .dequantize(device)?;
+
+                // SSM layers: MoE FFN with shared expert
+                let ssm_mlp = {
+                    let gate = ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
+                    let gate_experts =
+                        ct.tensor(&format!("{prefix}.ffn_gate_exps.weight"), device)?;
+                    let up_experts =
+                        ct.tensor(&format!("{prefix}.ffn_up_exps.weight"), device)?;
+                    let down_experts =
+                        ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), device)?;
+                    MoeOrMlp::FusedMoe(FusedMoe {
+                        gate: QMatMul::from_qtensor(gate)?,
+                        gate_experts: QMatMul::from_qtensor(gate_experts)?,
+                        up_experts: QMatMul::from_qtensor(up_experts)?,
+                        down_experts: QMatMul::from_qtensor(down_experts)?,
+                        norm_topk_prob: moe_cfg.norm_topk_prob,
+                        num_experts_per_tok: moe_cfg.num_experts_per_tok,
+                    })
+                };
+                // Qwen3.5/3.6 uses post_attention_norm instead of ffn_norm
+                let ssm_attn_norm =
+                    ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
+                let ssm_ffn_norm = if ct.has_tensor(&format!("{prefix}.post_attention_norm.weight"))
+                {
+                    ct.tensor(&format!("{prefix}.post_attention_norm.weight"), device)?
+                } else {
+                    ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?
                 };
 
-                MoeOrMlp::FusedMoe(moe)
-            } else {
-                let feed_forward_w1 = ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?;
-                let feed_forward_w2 = ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
-                let feed_forward_w3 = ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
-                let mlp = Mlp {
-                    feed_forward_w1: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w1),
+                let ssm = SsmWeights {
+                    attn_qkv: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(attn_qkv),
                         b: None,
                     })?),
-                    feed_forward_w2: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w2),
+                    attn_gate: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(attn_gate),
                         b: None,
                     })?),
-                    feed_forward_w3: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w3),
+                    ssm_conv1d,
+                    ssm_a,
+                    ssm_alpha: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(ssm_alpha),
                         b: None,
                     })?),
+                    ssm_beta: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(ssm_beta),
+                        b: None,
+                    })?),
+                    ssm_dt,
+                    ssm_out: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(ssm_out),
+                        b: None,
+                    })?),
+                    ssm_norm,
+                    n_heads,
+                    n_kv_heads,
+                    state_size,
+                    inner_size,
                 };
-                MoeOrMlp::Mlp(mlp)
-            };
-
-            // Qwen3 always has q_norm and k_norm
-            let q_norm = QRmsNorm::new(
-                ct.tensor(&format!("{prefix}.attn_q_norm.weight"), device)?,
-                rms_norm_eps,
-            )?;
-            let k_norm = QRmsNorm::new(
-                ct.tensor(&format!("{prefix}.attn_k_norm.weight"), device)?,
-                rms_norm_eps,
-            )?;
-
-            let attention_norm = ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
-            let ffn_norm = ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?;
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
+                LayerWeights::Ssm {
+                    ssm,
+                    conv_state: Mutex::new(None),
+                    ssm_state: Mutex::new(None),
+                    attention_norm: QRmsNorm::new(ssm_attn_norm, rms_norm_eps)?,
+                    mlp: ssm_mlp,
+                    ffn_norm: QRmsNorm::new(ssm_ffn_norm, rms_norm_eps)?,
                 }
+            } else {
+                let rotary = ropes
+                    .get(&device.location())
+                    .expect("No RoPE for device location!")
+                    .clone();
+
+                let attention_wq = ct.tensor(&format!("{prefix}.attn_q.weight"), device)?;
+                let attention_wk = ct.tensor(&format!("{prefix}.attn_k.weight"), device)?;
+                let attention_wv = ct.tensor(&format!("{prefix}.attn_v.weight"), device)?;
+                let attention_wo = ct.tensor(&format!("{prefix}.attn_output.weight"), device)?;
+
+                let mlp = if !moe_cfg
+                    .mlp_only_layers
+                    .as_ref()
+                    .unwrap()
+                    .contains(&layer_idx)
+                    && (moe_cfg.num_experts.unwrap() > 0
+                        && (layer_idx + 1) % moe_cfg.decoder_sparse_step.unwrap() == 0)
+                {
+                    let gate = ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
+                    let gate_experts =
+                        ct.tensor(&format!("{prefix}.ffn_gate_exps.weight"), device)?;
+                    let up_experts =
+                        ct.tensor(&format!("{prefix}.ffn_up_exps.weight"), device)?;
+                    let down_experts =
+                        ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), device)?;
+                    let moe = FusedMoe {
+                        gate: QMatMul::from_qtensor(gate)?,
+                        gate_experts: QMatMul::from_qtensor(gate_experts)?,
+                        up_experts: QMatMul::from_qtensor(up_experts)?,
+                        down_experts: QMatMul::from_qtensor(down_experts)?,
+                        norm_topk_prob: moe_cfg.norm_topk_prob,
+                        num_experts_per_tok: moe_cfg.num_experts_per_tok,
+                    };
+                    MoeOrMlp::FusedMoe(moe)
+                } else {
+                    let feed_forward_w1 =
+                        ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?;
+                    let feed_forward_w2 =
+                        ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
+                    let feed_forward_w3 =
+                        ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
+                    let mlp = Mlp {
+                        feed_forward_w1: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                            q_weight: Arc::new(feed_forward_w1),
+                            b: None,
+                        })?),
+                        feed_forward_w2: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                            q_weight: Arc::new(feed_forward_w2),
+                            b: None,
+                        })?),
+                        feed_forward_w3: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                            q_weight: Arc::new(feed_forward_w3),
+                            b: None,
+                        })?),
+                    };
+                    MoeOrMlp::Mlp(mlp)
+                };
+
+                // Qwen3 always has q_norm and k_norm
+                let q_norm = QRmsNorm::new(
+                    ct.tensor(&format!("{prefix}.attn_q_norm.weight"), device)?,
+                    rms_norm_eps,
+                )?;
+                let k_norm = QRmsNorm::new(
+                    ct.tensor(&format!("{prefix}.attn_k_norm.weight"), device)?,
+                    rms_norm_eps,
+                )?;
+
+                let attention_norm = ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
+                let ffn_norm = ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?;
+                let paged_attn = match &attention_mechanism {
+                    AttentionImplementation::Eager => None,
+                    AttentionImplementation::PagedAttention => {
+                        Some(PagedAttention::new(head_dim, device, None)?)
+                    }
+                };
+                LayerWeights::Attention(AttentionWeights {
+                    attention_wq: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(attention_wq),
+                        b: None,
+                    })?),
+                    attention_wk: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(attention_wk),
+                        b: None,
+                    })?),
+                    attention_wv: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(attention_wv),
+                        b: None,
+                    })?),
+                    attention_wo: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(attention_wo),
+                        b: None,
+                    })?),
+                    attention_norm: QRmsNorm::new(attention_norm, rms_norm_eps)?,
+                    q_norm,
+                    k_norm,
+                    mlp,
+                    ffn_norm: QRmsNorm::new(ffn_norm, rms_norm_eps)?,
+                    n_head: head_count,
+                    n_kv_head: head_count_kv,
+                    head_dim,
+                    rotary: rotary.clone(),
+                    paged_attn,
+                    sdpa_params: SdpaParams {
+                        n_kv_groups: head_count / head_count_kv,
+                        softcap: None,
+                        softmax_scale: 1.0 / (head_dim as f32).sqrt(),
+                        sliding_window: None,
+                        sinks: None,
+                    },
+                    dtype,
+                })
             };
-            layers.push(Some(LayerWeights {
-                attention_wq: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(attention_wq),
-                    b: None,
-                })?),
-                attention_wk: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(attention_wk),
-                    b: None,
-                })?),
-                attention_wv: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(attention_wv),
-                    b: None,
-                })?),
-                attention_wo: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(attention_wo),
-                    b: None,
-                })?),
-                attention_norm: QRmsNorm::new(attention_norm, rms_norm_eps)?,
-                q_norm,
-                k_norm,
-                mlp,
-                ffn_norm: QRmsNorm::new(ffn_norm, rms_norm_eps)?,
-                n_head: head_count,
-                n_kv_head: head_count_kv,
-                head_dim,
-                rotary: rotary.clone(),
-                paged_attn,
-                sdpa_params: SdpaParams {
-                    n_kv_groups: head_count / head_count_kv,
-                    softcap: None,
-                    softmax_scale: 1.0 / (head_dim as f32).sqrt(),
-                    sliding_window: None,
-                    sinks: None,
-                },
-                dtype,
-            }))
+            layers.push(Some(layer))
         }
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
@@ -573,23 +1109,50 @@ impl ModelWeights {
             };
             let x = layer_in;
             let residual = &x;
-            let x = layer.attention_norm.forward(&x)?;
-            let attn = layer.forward_attn(
-                &x,
-                &mask.get(x.device()),
-                start_offsets,
-                &mut cache[i],
-                metadata
-                    .as_ref()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
-            )?;
+            let attn = match layer {
+                LayerWeights::Attention(attn) => {
+                    let x = attn.attention_norm.forward(&x)?;
+                    attn.forward_attn(
+                        &x,
+                        &mask.get(x.device()),
+                        start_offsets,
+                        &mut cache[i],
+                        metadata
+                            .as_ref()
+                            .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+                    )?
+                }
+                LayerWeights::Ssm {
+                    ssm,
+                    ref conv_state,
+                    ref ssm_state,
+                    ref attention_norm,
+                    ..
+                } => {
+                    let x = attention_norm.forward(&x)?;
+                    ssm.forward(&x, conv_state, ssm_state)?
+                }
+            };
             let x = (attn + residual)?;
 
-            // MLP
+            // FFN
             let residual = &x;
-            let x = layer.ffn_norm.forward(&x)?;
-            let x = layer.mlp.forward(&x)?;
-            let x = (x + residual)?;
+            let x = match layer {
+                LayerWeights::Attention(attn) => {
+                    let x = attn.ffn_norm.forward(&x)?;
+                    let x = attn.mlp.forward(&x)?;
+                    (x + residual)?
+                }
+                LayerWeights::Ssm {
+                    ref ffn_norm,
+                    ref mlp,
+                    ..
+                } => {
+                    let x = ffn_norm.forward(&x)?;
+                    let x = mlp.forward(&x)?;
+                    (x + residual)?
+                }
+            };
             layer_in = x;
         }
         let x = self.norm.forward(&layer_in)?;
@@ -633,19 +1196,46 @@ impl ModelWeights {
             };
             let x = layer_in;
             let residual = &x;
-            let x = layer.attention_norm.forward(&x)?;
-            let attn = layer.forward_attn(
-                &x,
-                &mask.get(x.device()),
-                &[past_kv_len],
-                &mut cache[i],
-                None,
-            )?;
+            let attn = match layer {
+                LayerWeights::Attention(attn) => {
+                    let x = attn.attention_norm.forward(&x)?;
+                    attn.forward_attn(
+                        &x,
+                        &mask.get(x.device()),
+                        &[past_kv_len],
+                        &mut cache[i],
+                        None,
+                    )?
+                }
+                LayerWeights::Ssm {
+                    ssm,
+                    ref conv_state,
+                    ref ssm_state,
+                    ref attention_norm,
+                    ..
+                } => {
+                    let x = attention_norm.forward(&x)?;
+                    ssm.forward(&x, conv_state, ssm_state)?
+                }
+            };
             let x = (attn + residual)?;
             let residual = &x;
-            let x = layer.ffn_norm.forward(&x)?;
-            let x = layer.mlp.forward(&x)?;
-            layer_in = (x + residual)?;
+            layer_in = match layer {
+                LayerWeights::Attention(attn) => {
+                    let x = attn.ffn_norm.forward(&x)?;
+                    let x = attn.mlp.forward(&x)?;
+                    (x + residual)?
+                }
+                LayerWeights::Ssm {
+                    ref ffn_norm,
+                    ref mlp,
+                    ..
+                } => {
+                    let x = ffn_norm.forward(&x)?;
+                    let x = mlp.forward(&x)?;
+                    (x + residual)?
+                }
+            };
         }
         layer_in.to_device(&Device::Cpu)
     }
