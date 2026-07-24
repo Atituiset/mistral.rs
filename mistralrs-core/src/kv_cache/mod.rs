@@ -1,7 +1,7 @@
 use crate::attention::AttentionMask;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use candle_core::{Result, Tensor, D};
+use candle_core::{Device, Result, Tensor, D};
 
 use crate::{
     get_mut_arcmutex,
@@ -736,13 +736,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
 
         let layer_devices = pipeline.device_mapper().map(|device_mapper| {
             let total_layers = pipeline.cache().normal().0.len();
-            let mut layer_devices = Vec::with_capacity(total_layers);
+            let mut layer_devices: Vec<Option<Device>> = Vec::with_capacity(total_layers);
             for layer in 0..total_layers {
-                let device = device_mapper
-                    .device_for(layer, false)
-                    .cloned()
-                    .expect("Internal bug, layer out of range!");
-                layer_devices.push(device);
+                layer_devices.push(device_mapper.device_for(layer, false).cloned());
             }
             layer_devices
         });
@@ -750,6 +746,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         let old_caches = pipeline.cache().normal().0.clone();
 
         for (layer_idx, layer) in pipeline.cache().normal().0.iter_mut().enumerate() {
+            if let Some(ref layer_devices) = layer_devices {
+                if layer_devices[layer_idx].is_none() {
+                    layer.reset();
+                    continue;
+                }
+            }
             if !load_preallocated_cache {
                 layer.reset();
                 continue;
@@ -800,7 +802,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                     break;
                 };
                 if let Some(layer_devices) = &layer_devices {
-                    let layer_dev = &layer_devices[layer_idx];
+                    let layer_dev = match &layer_devices[layer_idx] {
+                        Some(dev) => dev,
+                        None => continue,
+                    };
                     k_preallocated_cache = k_preallocated_cache
                         .to_device(layer_dev)
                         .expect("Could not prepare cache");

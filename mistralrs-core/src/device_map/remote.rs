@@ -69,7 +69,8 @@ impl RemoteConnectionPool {
             .unwrap();
 
         let try_op = |stream: &mut TcpStream| -> Result<Vec<u8>> {
-            // Write header
+            // Write header: [1B cmd][4B LE start][4B LE end][4B LE past_kv][4B reserved][8B LE len]
+            tracing::debug!(target: "remote", "Sending cmd={cmd} start={layer_start} end={layer_end} len={}", payload.len());
             stream
                 .write_all(&[cmd])
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
@@ -78,6 +79,14 @@ impl RemoteConnectionPool {
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
             stream
                 .write_all(&layer_end.to_le_bytes())
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let past_kv: u32 = 0; // KV cache offset, 0 for first forward
+            stream
+                .write_all(&past_kv.to_le_bytes())
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+            let reserved: u32 = 0;
+            stream
+                .write_all(&reserved.to_le_bytes())
                 .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
             let len = payload.len() as u64;
             stream
