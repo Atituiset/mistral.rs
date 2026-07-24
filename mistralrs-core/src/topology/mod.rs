@@ -10,6 +10,7 @@ use serde::Deserialize;
 use crate::parse_isq_value;
 
 const DEVICE_PATTERN: &str = r"^(cpu|cuda\[(\d+)\]|metal\[(\d+)\])$";
+const REMOTE_DEVICE_PATTERN: &str = r"^remote:tcp://(.+):(\d+)$";
 
 #[derive(Deserialize)]
 pub struct DeserLayerTopology {
@@ -20,10 +21,30 @@ pub struct DeserLayerTopology {
 #[derive(Deserialize)]
 pub struct DeserTopology(IndexMap<String, DeserLayerTopology>);
 
+/// A device specifier that may be local (Cpu/Cuda/Metal) or a remote TCP worker.
+#[derive(Clone, Debug)]
+pub enum RemoteAwareDevice {
+    Local(Device),
+    Remote { addr: String },
+}
+
+impl RemoteAwareDevice {
+    pub fn to_device(&self) -> Option<&Device> {
+        match self {
+            RemoteAwareDevice::Local(d) => Some(d),
+            RemoteAwareDevice::Remote { .. } => None,
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, RemoteAwareDevice::Remote { .. })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LayerTopology {
     pub isq: Option<IsqType>,
-    pub device: Option<Device>,
+    pub device: Option<RemoteAwareDevice>,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -89,6 +110,18 @@ impl Topology {
                 .all(|(_, topo)| topo.device.as_ref().is_none())
     }
 
+    pub fn has_remote_devices(&self) -> bool {
+        self.layers.iter().any(|l| {
+            l.as_ref()
+                .and_then(|lt| lt.device.as_ref())
+                .is_some_and(|d| d.is_remote())
+        }) || self.patterns.iter().any(|(_, topo)| {
+            topo.device
+                .as_ref()
+                .is_some_and(|d| d.is_remote())
+        })
+    }
+
     pub fn with_range(mut self, range: Range<usize>, layer: LayerTopology) -> Self {
         if self.layers.len() < range.end {
             self.layers
@@ -104,6 +137,7 @@ impl Topology {
     pub fn from_str(topology: &str) -> anyhow::Result<Self> {
         let deser: DeserTopology = serde_saphyr::from_str(topology)?;
         let device_regex = Regex::new(DEVICE_PATTERN)?;
+        let remote_device_regex = Regex::new(REMOTE_DEVICE_PATTERN)?;
 
         let mut range_layers = Vec::new();
         let mut pattern_layers = Vec::new();
@@ -116,25 +150,32 @@ impl Topology {
                 None
             };
 
-            let parsed_device = if let Some(device) = device {
-                let Some(captures) = device_regex.captures(&device) else {
-                    anyhow::bail!(
-                        "Device specifier must match regex {DEVICE_PATTERN}. Examples: `cpu`, `cuda[ORD]`, `metal[ORD]`"
-                    );
-                };
-                let device = if let Some(val) = captures.get(2).or(captures.get(3)) {
-                    let ord = val.as_str().parse::<usize>()?;
-                    let device = device.split('[').collect::<Vec<_>>()[0];
-                    match device {
-                        "cuda" => Device::new_cuda(ord)?,
-                        "metal" => Device::new_metal(ord)?,
-                        _ => unreachable!(),
-                    }
+            let parsed_device = if let Some(device_spec) = device {
+                // Try remote pattern first: remote:tcp://IP:PORT
+                if let Some(captures) = remote_device_regex.captures(&device_spec) {
+                    let ip = captures.get(1).unwrap().as_str();
+                    let port = captures.get(2).unwrap().as_str();
+                    Some(RemoteAwareDevice::Remote {
+                        addr: format!("{ip}:{port}"),
+                    })
+                } else if let Some(captures) = device_regex.captures(&device_spec) {
+                    let device = if let Some(val) = captures.get(2).or(captures.get(3)) {
+                        let ord = val.as_str().parse::<usize>()?;
+                        let prefix = device_spec.split('[').collect::<Vec<_>>()[0];
+                        match prefix {
+                            "cuda" => Device::new_cuda(ord)?,
+                            "metal" => Device::new_metal(ord)?,
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        Device::Cpu
+                    };
+                    Some(RemoteAwareDevice::Local(device))
                 } else {
-                    Device::Cpu
-                };
-
-                Some(device)
+                    anyhow::bail!(
+                        "Device specifier must match {DEVICE_PATTERN} or {REMOTE_DEVICE_PATTERN}. Examples: `cpu`, `cuda[ORD]`, `metal[ORD]`, `remote:tcp://IP:PORT`"
+                    );
+                }
             } else {
                 None
             };
@@ -248,7 +289,7 @@ impl Topology {
                 predicate: Some(regex.clone()),
                 layer_range: None,
                 ty: topo.isq,
-                device: topo.device.clone(),
+                device: topo.device.as_ref().and_then(|d| d.to_device().cloned()),
             })
             .collect::<Vec<_>>();
         for (index, layer) in self.layers.iter().enumerate() {
@@ -260,7 +301,7 @@ impl Topology {
                 predicate: None,
                 layer_range: Some(index..index + 1),
                 ty: layer.isq,
-                device: layer.device.clone(),
+                device: layer.device.as_ref().and_then(|d| d.to_device().cloned()),
             });
         }
         overrides

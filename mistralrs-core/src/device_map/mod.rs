@@ -1,11 +1,13 @@
 mod mappers;
 mod mask;
 mod peer;
+mod remote;
 
 #[allow(unused_imports)]
 pub use mappers::NcclPipelineParallelMapper;
 pub use mappers::{DeviceMapper, DummyDeviceMapper, LayerDeviceMapper, NcclDeviceMapper};
 pub use mask::DeviceMappedMask;
+pub use remote::{RemoteConnectionPool, RemoteLayerMapper};
 
 use std::sync::Arc;
 
@@ -129,25 +131,77 @@ impl DeviceMapMetadata {
             return Ok(dummy_mapper(device));
         }
 
-        let mappings = topology
+        let layer_specs: Vec<crate::topology::RemoteAwareDevice> = topology
             .layers
             .iter()
             .map(|layer| {
                 layer
                     .as_ref()
-                    .map(|x| x.device.clone().unwrap_or(device.clone()))
-                    .unwrap_or(device.clone())
+                    .and_then(|x| x.device.clone())
+                    .unwrap_or(crate::topology::RemoteAwareDevice::Local(device.clone()))
             })
-            .collect::<Vec<_>>();
+            .collect();
 
-        info!(
-            "Loading model according to the following repeating layer mappings based on topology:"
-        );
-        for (i, dev) in mappings.iter().enumerate() {
-            info!("Layer {i}: {}", dev.device_pretty_repr());
+        let has_remote = layer_specs.iter().any(|d| d.is_remote());
+
+        if has_remote {
+            info!(
+                "Loading model with remote layer mapping based on topology:"
+            );
+            for (i, spec) in layer_specs.iter().enumerate() {
+                match spec {
+                    crate::topology::RemoteAwareDevice::Local(dev) => {
+                        info!("Layer {i}: {} (local)", dev.device_pretty_repr());
+                    }
+                    crate::topology::RemoteAwareDevice::Remote { addr } => {
+                        info!("Layer {i}: remote → {addr}");
+                    }
+                }
+            }
+
+            // Build a local mapper for non-remote layers
+            let local_mappings: Vec<Device> = layer_specs
+                .iter()
+                .map(|d| match d {
+                    crate::topology::RemoteAwareDevice::Local(dev) => dev.clone(),
+                    crate::topology::RemoteAwareDevice::Remote { .. } => Device::Cpu,
+                })
+                .collect();
+
+            let mut peer_devices = local_mappings.clone();
+            peer_devices.push(device.clone());
+            let cuda_peer_access = CudaPeerAccess::new(&peer_devices)?;
+            let local_mapper = LayerDeviceMapper::new(
+                local_mappings,
+                device.clone(),
+                cuda_peer_access,
+            );
+            let connection_pool =
+                RemoteConnectionPool::new(&layer_specs)?;
+            Ok(Box::new(RemoteLayerMapper::new(
+                local_mapper,
+                connection_pool,
+                layer_specs,
+            )))
+        } else {
+            // All local: use standard LayerDeviceMapper
+            let mappings: Vec<Device> = layer_specs
+                .iter()
+                .map(|d| match d {
+                    crate::topology::RemoteAwareDevice::Local(dev) => dev.clone(),
+                    crate::topology::RemoteAwareDevice::Remote { .. } => unreachable!(),
+                })
+                .collect();
+
+            info!(
+                "Loading model according to the following repeating layer mappings based on topology:"
+            );
+            for (i, dev) in mappings.iter().enumerate() {
+                info!("Layer {i}: {}", dev.device_pretty_repr());
+            }
+
+            layer_mapper(mappings, device)
         }
-
-        layer_mapper(mappings, device)
     }
 
     fn manual_mappings(

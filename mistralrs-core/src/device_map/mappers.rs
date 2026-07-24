@@ -23,6 +23,12 @@ pub trait DeviceMapper: Debug {
     fn get_comm_for(&self, layer_idx: usize) -> Result<Arc<mistralrs_quant::Comm>>;
 
     fn get_min_dtype(&self, dtype: &dyn TryIntoDType) -> Result<DType>;
+
+    /// Returns true if this layer's weights reside on a remote machine and should
+    /// not be loaded locally.
+    fn is_layer_remote(&self, _layer: usize) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
