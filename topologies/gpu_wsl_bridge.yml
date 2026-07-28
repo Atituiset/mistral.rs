@@ -1,0 +1,7 @@
+# GPU PC + WSL 双机桥接拓扑
+# GPU (RTX 4050 6GB): 前 8 层
+# WSL (CPU 15GB): 剩余 16 层 (Qwen2-0.5B 共 24 层)
+0-7:
+  device: cuda[0]
+8-23:
+  device: remote:tcp://127.0.0.1:5051
