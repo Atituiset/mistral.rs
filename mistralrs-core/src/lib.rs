@@ -131,7 +131,7 @@ pub use agent_approval::{
 pub use amoe::{AnyMoeConfig, AnyMoeExpertType};
 pub use device_map::{
     deserialize_tensor, serialize_tensor, DeviceLayerMapMetadata, DeviceMapMetadata,
-    DeviceMapSetting, LayerDeviceMapper,
+    DeviceMapSetting, LayerDeviceMapper, RangeLimitedMapper,
 };
 pub use files::{
     format_from_name, is_text_mime, mime_for_format, File, FileContent, FileSource, FileStore,

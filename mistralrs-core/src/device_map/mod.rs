@@ -5,7 +5,9 @@ mod remote;
 
 #[allow(unused_imports)]
 pub use mappers::NcclPipelineParallelMapper;
-pub use mappers::{DeviceMapper, DummyDeviceMapper, LayerDeviceMapper, NcclDeviceMapper};
+pub use mappers::{
+    DeviceMapper, DummyDeviceMapper, LayerDeviceMapper, NcclDeviceMapper, RangeLimitedMapper,
+};
 pub use mask::DeviceMappedMask;
 pub use remote::{deserialize_tensor, serialize_tensor, RemoteConnectionPool, RemoteLayerMapper};
 

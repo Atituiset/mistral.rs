@@ -1,0 +1,9 @@
+# GPU PC + WSL 双机桥接 — Qwen3.6-35B-A3B (41层)
+# GPU PC: CUDA 0-14 + CPU 15-22
+# WSL:    remote worker 23-40
+0-14:
+  device: cuda[0]
+15-22:
+  device: cpu
+23-40:
+  device: remote:tcp://172.26.88.148:5051

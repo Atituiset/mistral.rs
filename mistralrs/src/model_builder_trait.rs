@@ -823,6 +823,7 @@ pub async fn build_gguf_pipeline(
 
     let config = GGUFSpecificConfig {
         topology: builder.topology.clone(),
+        ..Default::default()
     };
 
     maybe_initialize_logging(builder.with_logging);

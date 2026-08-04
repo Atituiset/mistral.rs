@@ -265,6 +265,75 @@ impl DeviceMapper for NcclDeviceMapper {
     }
 }
 
+/// Wraps a DeviceMapper to restrict which layers are loaded locally.
+/// Layers outside [range_start, range_end] report is_layer_remote() = true
+/// so model constructors skip loading their weights.
+#[derive(Debug)]
+pub struct RangeLimitedMapper {
+    inner: Box<dyn DeviceMapper + Send + Sync>,
+    range_start: usize,
+    range_end: usize,
+}
+
+impl RangeLimitedMapper {
+    pub fn new(
+        inner: Box<dyn DeviceMapper + Send + Sync>,
+        range_start: usize,
+        range_end: usize,
+    ) -> Self {
+        Self {
+            inner,
+            range_start,
+            range_end,
+        }
+    }
+}
+
+impl DeviceMapper for RangeLimitedMapper {
+    fn map(&self, input: Tensor, layer: usize) -> Result<Tensor> {
+        self.inner.map(input, layer)
+    }
+    fn set_device(
+        &self,
+        layer: usize,
+        varbuilder: ShardedVarBuilder,
+        loading_isq: bool,
+    ) -> ShardedVarBuilder {
+        self.inner.set_device(layer, varbuilder, loading_isq)
+    }
+    fn device_for(&self, layer: usize, loading_isq: bool) -> Option<&Device> {
+        if layer < self.range_start || layer > self.range_end {
+            None
+        } else {
+            self.inner.device_for(layer, loading_isq)
+        }
+    }
+    fn get_unique_devices(&self) -> Vec<Device> {
+        self.inner.get_unique_devices()
+    }
+    fn cast_nm_device(&self, x: &Tensor, loading_isq: bool) -> Result<Tensor> {
+        self.inner.cast_nm_device(x, loading_isq)
+    }
+    fn set_nm_device(&self, varbuilder: ShardedVarBuilder, loading_isq: bool) -> ShardedVarBuilder {
+        self.inner.set_nm_device(varbuilder, loading_isq)
+    }
+    fn num_device_mapping_layers(&self) -> usize {
+        self.range_end - self.range_start + 1
+    }
+    fn get_comm_for(&self, layer_idx: usize) -> Result<Arc<mistralrs_quant::Comm>> {
+        self.inner.get_comm_for(layer_idx)
+    }
+    fn get_min_dtype(&self, dtype: &dyn TryIntoDType) -> Result<DType> {
+        self.inner.get_min_dtype(dtype)
+    }
+    fn is_layer_remote(&self, layer: usize) -> bool {
+        layer < self.range_start || layer > self.range_end || self.inner.is_layer_remote(layer)
+    }
+    fn set_past_kv(&self, past_kv: u32) {
+        self.inner.set_past_kv(past_kv)
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct NcclPipelineParallelMapper {

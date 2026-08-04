@@ -564,6 +564,7 @@ fn parse_which(
             quantized_filename.map_left(|f| vec![f]).into_inner(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                ..Default::default()
             },
             no_kv_cache,
             jinja_explicit,
@@ -586,6 +587,7 @@ fn parse_which(
             quantized_filename.map_left(|f| vec![f]).into_inner(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                ..Default::default()
             },
             no_kv_cache,
             jinja_explicit,
@@ -616,6 +618,7 @@ fn parse_which(
             quantized_filename.map_left(|f| vec![f]).into_inner(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
+                ..Default::default()
             },
             no_kv_cache,
             jinja_explicit,

@@ -27,20 +27,29 @@ pub fn run_remote_worker(
     model_dir: &str,
     model_file: &str,
     listen_addr: &str,
-    _start_layer: usize,
-    _end_layer: usize,
+    start_layer: usize,
+    end_layer: usize,
 ) -> anyhow::Result<()> {
     let model_path = PathBuf::from(model_dir).join(model_file);
     if !model_path.exists() {
         anyhow::bail!("Model file not found: {}", model_path.display());
     }
 
+    let layer_range = if start_layer == 0 && end_layer == 0 {
+        None // Load all layers
+    } else {
+        Some((start_layer, end_layer))
+    };
+
     let loader_builder = GGUFLoaderBuilder::new(
         None,
         None,
         model_dir.to_string(),
         vec![model_file.to_string()],
-        GGUFSpecificConfig::default(),
+        GGUFSpecificConfig {
+            layer_range,
+            ..Default::default()
+        },
         false,
         None,
     );

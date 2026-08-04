@@ -8,7 +8,7 @@ use super::{
     MetadataMixin, ModelCategory, PreProcessingMixin,
 };
 use crate::attention::ATTENTION_CHUNK_SIZE;
-use crate::device_map::{self, DeviceMapper};
+use crate::device_map::{self, DeviceMapper, RangeLimitedMapper};
 use crate::distributed::WorkerTransferData;
 use crate::gguf::{
     get_gguf_chat_template, {convert_gguf_to_hf_tokenizer, GgufTokenizerConversion},
@@ -122,6 +122,8 @@ pub struct GGUFLoader {
 /// Config for a GGUF loader.
 pub struct GGUFSpecificConfig {
     pub topology: Option<Topology>,
+    /// Only load layers in this inclusive range. Layers outside are skipped.
+    pub layer_range: Option<(usize, usize)>,
 }
 
 #[derive(Default)]
@@ -403,6 +405,12 @@ impl Loader for GGUFLoader {
             self.config.topology.as_ref(),
             &available_devices,
         )?;
+        let mapper: Box<dyn DeviceMapper + Send + Sync> =
+            if let Some((start, end)) = self.config.layer_range {
+                Box::new(RangeLimitedMapper::new(mapper, start, end))
+            } else {
+                mapper
+            };
         let mut layer_devices = Vec::new();
         for layer in 0..num_layers {
             let device = mapper.device_for(layer, false).cloned();
