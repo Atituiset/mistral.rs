@@ -30,6 +30,13 @@ pub trait DeviceMapper: Debug {
         false
     }
 
+    /// Returns true if this instance only loads a slice of layers (a remote worker
+    /// with a layer range) and never runs the full forward pass, so the embedding
+    /// table / final norm / lm head are dead weight.
+    fn is_partial(&self) -> bool {
+        false
+    }
+
     /// Set the current KV cache position for the upcoming forward pass.
     /// Only meaningful for remote-layer mappers that send hidden states over TCP.
     fn set_past_kv(&self, _past_kv: u32) {}
@@ -328,6 +335,9 @@ impl DeviceMapper for RangeLimitedMapper {
     }
     fn is_layer_remote(&self, layer: usize) -> bool {
         layer < self.range_start || layer > self.range_end || self.inner.is_layer_remote(layer)
+    }
+    fn is_partial(&self) -> bool {
+        true
     }
     fn set_past_kv(&self, past_kv: u32) {
         self.inner.set_past_kv(past_kv)

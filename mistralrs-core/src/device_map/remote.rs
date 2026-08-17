@@ -163,9 +163,7 @@ pub fn deserialize_tensor(data: &[u8], device: &Device) -> Result<Tensor> {
     let n_dims = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
     let mut shape = Vec::with_capacity(n_dims);
     for i in 0..n_dims {
-        shape.push(u64::from_le_bytes(
-            data[16 + i * 8..24 + i * 8].try_into().unwrap(),
-        ) as usize);
+        shape.push(u64::from_le_bytes(data[16 + i * 8..24 + i * 8].try_into().unwrap()) as usize);
     }
     let data_offset = 16 + n_dims * 8;
     let expected_bytes = n_elements * 4;
@@ -177,10 +175,7 @@ pub fn deserialize_tensor(data: &[u8], device: &Device) -> Result<Tensor> {
         )));
     }
     let f32_data: &[f32] = unsafe {
-        std::slice::from_raw_parts(
-            data[data_offset..].as_ptr() as *const f32,
-            n_elements,
-        )
+        std::slice::from_raw_parts(data[data_offset..].as_ptr() as *const f32, n_elements)
     };
     Tensor::from_vec(f32_data.to_vec(), shape.as_slice(), device)
 }
@@ -280,9 +275,14 @@ impl DeviceMapper for RemoteLayerMapper {
                 let target_device = input.device().clone();
                 let payload = serialize_tensor(&input)?;
                 let past_kv = self.past_kv.load(std::sync::atomic::Ordering::Relaxed);
-                let resp = self
-                    .connection_pool
-                    .roundtrip(addr, 0x00, *start as u32, *end as u32, past_kv, &payload)?;
+                let resp = self.connection_pool.roundtrip(
+                    addr,
+                    0x00,
+                    *start as u32,
+                    *end as u32,
+                    past_kv,
+                    &payload,
+                )?;
                 self.last_remote_block
                     .store(block_idx, std::sync::atomic::Ordering::Relaxed);
                 let cpu_result = deserialize_tensor(&resp, &Device::Cpu)?;
@@ -304,8 +304,7 @@ impl DeviceMapper for RemoteLayerMapper {
     ) -> mistralrs_quant::ShardedVarBuilder {
         match self.layer_specs.get(layer) {
             Some(RemoteAwareDevice::Local(_)) => {
-                self.local_mapper
-                    .set_device(layer, varbuilder, loading_isq)
+                self.local_mapper.set_device(layer, varbuilder, loading_isq)
             }
             _ => varbuilder.set_device(Device::Cpu),
         }
@@ -316,7 +315,10 @@ impl DeviceMapper for RemoteLayerMapper {
             return self.local_mapper.device_for(layer, loading_isq);
         }
         match self.layer_specs.get(layer) {
-            Some(RemoteAwareDevice::Local(dev)) => Some(dev),
+            // Local weights must land on the canonicalized local_mapper device, not the raw
+            // topology device: same_device() compares DeviceId counters, and kernels that
+            // check it (rotary) fail when weights and hidden states use different objects.
+            Some(RemoteAwareDevice::Local(_)) => self.local_mapper.device_for(layer, loading_isq),
             Some(RemoteAwareDevice::Remote { .. }) => {
                 // Return None: caller should skip weight loading for this layer
                 None
@@ -359,12 +361,11 @@ impl DeviceMapper for RemoteLayerMapper {
     }
 
     fn is_layer_remote(&self, layer: usize) -> bool {
-        self.layer_specs
-            .get(layer)
-            .is_some_and(|d| d.is_remote())
+        self.layer_specs.get(layer).is_some_and(|d| d.is_remote())
     }
 
     fn set_past_kv(&self, past_kv: u32) {
-        self.past_kv.store(past_kv, std::sync::atomic::Ordering::Relaxed);
+        self.past_kv
+            .store(past_kv, std::sync::atomic::Ordering::Relaxed);
     }
 }

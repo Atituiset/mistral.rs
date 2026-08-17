@@ -14,7 +14,6 @@ use crate::pipeline::{extract_logits, EitherCache, KvCache, NormalCache};
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
-use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Embedding, Module};
 use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
@@ -28,20 +27,6 @@ struct Mlp {
     feed_forward_w3: Arc<dyn QuantMethod>,
 }
 
-// candle's QTensor::indexed_moe_forward is cuda-only; other devices take the
-// dequantize-and-gather fallback
-fn experts_moe_forward(
-    w: &QMatMul,
-    xs: &candle_core::Tensor,
-    indices: &candle_core::Tensor,
-) -> candle_core::Result<candle_core::Tensor> {
-    if xs.device().is_cuda() {
-        w.indexed_moe_forward(xs, indices)
-    } else {
-        mistralrs_quant::cpu_indexed_moe_forward(w, xs, indices)
-    }
-}
-
 impl Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let w1 = self.feed_forward_w1.forward(xs)?;
@@ -51,105 +36,9 @@ impl Mlp {
     }
 }
 
-// Shared expert (always-on) for Qwen3.5/3.6 MoE: dense SiLU MLP scaled by a
-// sigmoid gate computed as sigmoid(sum(x * ffn_gate_inp_shexp)) per token.
-struct SharedExpert {
-    gate: Arc<dyn QuantMethod>,
-    up: Arc<dyn QuantMethod>,
-    down: Arc<dyn QuantMethod>,
-    // [hidden]; per-token scalar gate weights
-    gate_inp: Option<Tensor>,
-}
-
-impl SharedExpert {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = self.gate.forward(xs)?;
-        let up = self.up.forward(xs)?;
-        let y = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
-        let y = self.down.forward(&y)?;
-        if let Some(w) = &self.gate_inp {
-            let (batch, seq_len, hidden_dim) = xs.dims3()?;
-            let g = xs
-                .reshape(((), hidden_dim))?
-                .broadcast_mul(w)?
-                .sum_keepdim(D::Minus1)?;
-            let g = candle_nn::ops::sigmoid(&g)?.reshape((batch, seq_len, 1))?;
-            y.broadcast_mul(&g)
-        } else {
-            Ok(y)
-        }
-    }
-}
-
-struct FusedMoe {
-    gate: QMatMul,
-    gate_experts: QMatMul,
-    up_experts: QMatMul,
-    down_experts: QMatMul,
-    shared_expert: Option<SharedExpert>,
-    norm_topk_prob: bool,
-    num_experts_per_tok: usize,
-}
-
-impl FusedMoe {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (batch, seq_len, hidden_dim) = xs.dims3()?;
-        let xs_flat = xs.reshape(((), hidden_dim))?;
-        let original_dtype = xs_flat.dtype();
-        let (num_tokens, hidden_dim) = xs_flat.dims2()?;
-        let router_logits = self.gate.forward(&xs_flat.to_dtype(DType::F32)?)?;
-        let topk = crate::ops::moe_router_topk(
-            &router_logits,
-            crate::ops::MoeRouterTopKConfig {
-                top_k: self.num_experts_per_tok,
-                score_function: crate::ops::MoeRouterScoreFunction::Softmax,
-                selected_weight: crate::ops::MoeRouterSelectedWeight::Score,
-                renormalize: self.norm_topk_prob,
-                norm_min: 0.0,
-                output_scale: 1.0,
-                logit_clip: None,
-            },
-            None,
-            None,
-        )?;
-        let (scores, indices) = (topk.values, topk.indices);
-
-        let ys = {
-            let xs_flat = xs_flat.reshape((num_tokens, 1, hidden_dim))?;
-            let gate = experts_moe_forward(&self.gate_experts, &xs_flat, &indices)?;
-            let up = experts_moe_forward(&self.up_experts, &xs_flat, &indices)?;
-            let activated = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
-            experts_moe_forward(&self.down_experts, &activated, &indices)?
-        };
-        let y = ys
-            .broadcast_mul(&scores.unsqueeze(D::Minus1)?)?
-            .sum(D::Minus2)?
-            .reshape((batch, seq_len, hidden_dim))?;
-        let y = match &self.shared_expert {
-            Some(shared) => (y + shared.forward(xs)?)?,
-            None => y,
-        };
-        y.to_dtype(original_dtype)
-    }
-}
-
-enum MoeOrMlp {
-    FusedMoe(FusedMoe),
-    Mlp(Mlp),
-}
-
-impl MoeOrMlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Mlp(m) => m.forward(xs),
-            Self::FusedMoe(m) => m.forward(xs),
-        }
-    }
-}
-
-// SSM (Gated DeltaNet) layer weights for Qwen3.5/3.6 MoE hybrid architecture.
-// Each SSM layer uses a causal conv1d for local mixing followed by a
-// gated delta-rule recurrence that maintains a square state matrix per head.
+// SSM (Gated DeltaNet) layer weights for Qwen3.5/3.6 dense hybrid architecture.
+// Mirrors the SSM implementation in quantized_qwen3_moe.rs; only the FFN differs
+// (dense MLP here instead of routed experts).
 struct SsmWeights {
     // fused QKV input projection [d_model, 2*inner_size] — after conv+silu
     // it is split into q [n_kv_heads*state_size], k [n_kv_heads*state_size],
@@ -469,41 +358,6 @@ fn norm_gated(output: &Tensor, gate: &Tensor, norm_weight: &Tensor, eps: f64) ->
     normed.broadcast_mul(&gate_act)
 }
 
-// Loads the shared-expert weights for one layer if present (Qwen3.5/3.6 MoE
-// only; plain qwen3moe GGUFs have no ffn_*_shexp tensors).
-fn load_shared_expert<R: std::io::Seek + std::io::Read>(
-    ct: &mut Content<'_, R>,
-    prefix: &str,
-    device: &Device,
-) -> Result<Option<SharedExpert>> {
-    if !ct.has_tensor(&format!("{prefix}.ffn_gate_shexp.weight")) {
-        return Ok(None);
-    }
-    let gate_inp = if ct.has_tensor(&format!("{prefix}.ffn_gate_inp_shexp.weight")) {
-        Some(
-            ct.tensor(&format!("{prefix}.ffn_gate_inp_shexp.weight"), device)?
-                .dequantize(device)?,
-        )
-    } else {
-        None
-    };
-    Ok(Some(SharedExpert {
-        gate: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-            q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_gate_shexp.weight"), device)?),
-            b: None,
-        })?),
-        up: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-            q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_up_shexp.weight"), device)?),
-            b: None,
-        })?),
-        down: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-            q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_down_shexp.weight"), device)?),
-            b: None,
-        })?),
-        gate_inp,
-    }))
-}
-
 enum LayerWeights {
     Attention(AttentionWeights),
     Ssm {
@@ -511,7 +365,7 @@ enum LayerWeights {
         conv_state: Mutex<Option<Tensor>>,
         ssm_state: Mutex<Option<Tensor>>,
         attention_norm: QRmsNorm,
-        mlp: MoeOrMlp,
+        mlp: Mlp,
         ffn_norm: QRmsNorm,
     },
 }
@@ -524,13 +378,11 @@ struct AttentionWeights {
     attention_norm: QRmsNorm,
     q_norm: QRmsNorm,
     k_norm: QRmsNorm,
-    mlp: MoeOrMlp,
+    mlp: Mlp,
     ffn_norm: QRmsNorm,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
-    // Qwen3.5/3.6 MoE fuses an output gate into attn_q (out = 2 * n_head * head_dim)
-    has_attn_gate: bool,
     rotary: Arc<RotaryEmbedding>,
     paged_attn: Option<PagedAttention>,
     sdpa_params: SdpaParams,
@@ -548,22 +400,14 @@ impl AttentionWeights {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
-        // When the gate is fused, attn_q outputs [q | gate] per head; the gate is
-        // applied as sigmoid on the attention output (Qwen3.5 gated attention).
-        let q = self.attention_wq.forward(x)?;
-        let (q, gate) = if self.has_attn_gate {
-            let q_gate = q.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
-            let q = q_gate.narrow(D::Minus1, 0, self.head_dim)?;
-            let gate = q_gate
-                .narrow(D::Minus1, self.head_dim, self.head_dim)?
-                .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
-            (q, Some(gate))
-        } else {
-            (
-                q.reshape((b_sz, seq_len, self.n_head, self.head_dim))?,
-                None,
-            )
-        };
+        // attn_q.weight is fused [q | gate]: out = n_head * head_dim * 2, split per head
+        // and applied as sigmoid(gate) on the attention output (Qwen3.5 gated attention).
+        let q_gate = self.attention_wq.forward(x)?;
+        let q_gate = q_gate.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
+        let q = q_gate.narrow(D::Minus1, 0, self.head_dim)?;
+        let gate = q_gate
+            .narrow(D::Minus1, self.head_dim, self.head_dim)?
+            .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
         let k = self.attention_wk.forward(x)?;
         let v = self.attention_wv.forward(x)?;
 
@@ -629,13 +473,8 @@ impl AttentionWeights {
             y.reshape((b_sz, seq_len, ()))?
         };
 
-        let y = match gate {
-            Some(gate) => {
-                let gate = candle_nn::ops::sigmoid(&gate.to_dtype(y.dtype())?)?;
-                y.broadcast_mul(&gate)?
-            }
-            None => y,
-        };
+        let gate = candle_nn::ops::sigmoid(&gate.to_dtype(y.dtype())?)?;
+        let y = y.broadcast_mul(&gate)?;
         let y = self.attention_wo.forward(&y.to_dtype(x.dtype())?)?;
         Ok(y)
     }
@@ -653,23 +492,6 @@ pub struct ModelWeights {
     dtype: DType,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct QwenMoEConfig {
-    pub moe_intermediate_size: usize,
-    pub num_experts: Option<usize>,
-    pub mlp_only_layers: Option<Vec<usize>>,
-    pub decoder_sparse_step: Option<usize>,
-    pub norm_topk_prob: bool,
-    pub num_experts_per_tok: usize,
-    pub ssm_inner_size: Option<usize>,
-    pub ssm_state_size: Option<usize>,
-    pub ssm_conv_kernel: Option<usize>,
-    pub ssm_time_step_rank: Option<usize>,
-    pub ssm_group_count: Option<usize>,
-    pub full_attention_interval: Option<usize>,
-}
-
 pub(crate) struct PropsGGUF {
     pub head_count: usize,
     pub head_count_kv: usize,
@@ -678,9 +500,9 @@ pub(crate) struct PropsGGUF {
     pub rms_norm_eps: f32,
     pub max_seq_len: usize,
     pub rope_freq_base: f32,
+    pub rope_dimension_count: usize,
     pub key_length: usize,
     pub value_length: usize,
-    pub moe_cfg: QwenMoEConfig,
     pub ssm_state_size: usize,
     pub ssm_time_step_rank: usize,
     pub ssm_inner_size: usize,
@@ -688,7 +510,7 @@ pub(crate) struct PropsGGUF {
     pub full_attention_interval: usize,
 }
 
-fn verify_qwen3_arch(
+fn verify_qwen35_arch(
     metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>,
 ) -> Result<String> {
     use crate::utils::gguf_metadata::TryValueInto;
@@ -697,8 +519,8 @@ fn verify_qwen3_arch(
         .cloned()
         .try_value_into()?;
 
-    if actual_arch != "qwen3" && actual_arch != "qwen3moe" && actual_arch != "qwen35moe" {
-        candle_core::bail!("Expected `qwen3` architecture, got `{actual_arch}`.");
+    if actual_arch != "qwen35" {
+        candle_core::bail!("Expected `qwen35` architecture, got `{actual_arch}`.");
     }
     Ok(actual_arch)
 }
@@ -707,13 +529,14 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
     type Error = anyhow::Error;
 
     fn try_from(c: ContentMetadata) -> std::result::Result<Self, Self::Error> {
-        let _ = verify_qwen3_arch(c.metadata)?;
+        let _ = verify_qwen35_arch(c.metadata)?;
 
         let required = [
             "attention.head_count",
             "attention.head_count_kv",
             "block_count",
             "embedding_length",
+            "feed_forward_length",
             "attention.layer_norm_rms_epsilon",
         ];
         c.has_required_keys(&required)?;
@@ -734,11 +557,6 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             .ok()
             .map(|x| x as usize)
             .unwrap_or(0);
-        let ssm_conv_kernel = c
-            .get_value::<u32>("ssm.conv_kernel")
-            .ok()
-            .map(|x| x as usize)
-            .unwrap_or(0);
         let ssm_time_step_rank = c
             .get_value::<u32>("ssm.time_step_rank")
             .ok()
@@ -754,45 +572,6 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             .ok()
             .map(|x| x as usize)
             .unwrap_or(1);
-
-        let moe_cfg = QwenMoEConfig {
-            moe_intermediate_size: c.get_value::<u32>("expert_feed_forward_length")? as usize,
-            num_experts: Some(c.get_value::<u32>("expert_count")? as usize),
-            mlp_only_layers: Some(vec![]),
-            decoder_sparse_step: Some(1),
-            norm_topk_prob: true,
-            num_experts_per_tok: c.get_value::<u32>("expert_used_count")? as usize,
-            ssm_inner_size: if ssm_inner_size > 0 {
-                Some(ssm_inner_size)
-            } else {
-                None
-            },
-            ssm_state_size: if ssm_state_size > 0 {
-                Some(ssm_state_size)
-            } else {
-                None
-            },
-            ssm_conv_kernel: if ssm_conv_kernel > 0 {
-                Some(ssm_conv_kernel)
-            } else {
-                None
-            },
-            ssm_time_step_rank: if ssm_time_step_rank > 0 {
-                Some(ssm_time_step_rank)
-            } else {
-                None
-            },
-            ssm_group_count: if ssm_group_count > 0 {
-                Some(ssm_group_count)
-            } else {
-                None
-            },
-            full_attention_interval: if full_attention_interval > 1 {
-                Some(full_attention_interval)
-            } else {
-                None
-            },
-        };
 
         let props = Self {
             head_count,
@@ -810,6 +589,13 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
                 .ok()
                 .unwrap_or(DEFAULT_MAX_SEQ_LEN as u64) as usize,
             rope_freq_base: c.get_value("rope.freq_base").ok().unwrap_or(10_000_f32),
+            // Qwen3.5/3.6 full-attention layers use partial rotary
+            // (rope.dimension_count < head_dim, e.g. 64 of 256)
+            rope_dimension_count: c
+                .get_value::<u32>("rope.dimension_count")
+                .ok()
+                .map(|x| x as usize)
+                .unwrap_or(0),
             key_length: c
                 .get_value::<u32>("attention.key_length")
                 .ok()
@@ -820,7 +606,6 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
                 .ok()
                 .map(|x| x as usize)
                 .unwrap_or(embed_len / head_count),
-            moe_cfg,
             ssm_state_size,
             ssm_time_step_rank,
             ssm_inner_size,
@@ -842,7 +627,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
     ) -> Result<Self> {
         // Parameter extraction from metadata.
         let meta = ct.get_metadata();
-        let actual_arch = verify_qwen3_arch(meta)?;
+        let actual_arch = verify_qwen35_arch(meta)?;
 
         let metadata = ContentMetadata {
             path_prefix: &actual_arch,
@@ -856,9 +641,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
             rms_norm_eps,
             max_seq_len,
             rope_freq_base,
+            rope_dimension_count,
             key_length,
             value_length,
-            moe_cfg,
             ssm_state_size,
             ssm_time_step_rank,
             ssm_inner_size,
@@ -867,7 +652,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
 
         // Keep the embedding table on CPU and in the compute dtype: as F32 it is
-        // ~2 GiB on the 35B (vocab 248320, hidden 2048) and exhausts small hosts/workers.
+        // ~5 GiB on the 27B (vocab 248320, hidden 5120) and exhausts small hosts/workers.
         // A partial worker (layer_range set) only runs forward_from_layer on hidden
         // states, so the embedding table / final norm / lm head are dead weight; load
         // dummies for whichever side this instance does not own. The host still runs
@@ -918,6 +703,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 "Expected key_length == value_length, got {key_length} != {value_length}"
             );
         }
+        let rot_dim = if rope_dimension_count > 0 {
+            rope_dimension_count
+        } else {
+            head_dim
+        };
 
         let mut ropes = HashMap::new();
         for layer_idx in 0..block_count {
@@ -929,9 +719,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
             };
             ropes.insert(
                 rope_dev.location(),
-                Arc::new(RotaryEmbedding::new(
+                Arc::new(RotaryEmbedding::new_partial(
                     rope_freq_base,
-                    head_dim,
+                    rot_dim,
                     max_seq_len,
                     rope_dev,
                     true,
@@ -980,24 +770,23 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     .tensor(&format!("{prefix}.ssm_norm.weight"), device)?
                     .dequantize(device)?;
 
-                // SSM layers: MoE FFN with shared expert
-                let ssm_mlp = {
-                    let gate = ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
-                    let gate_experts =
-                        ct.tensor(&format!("{prefix}.ffn_gate_exps.weight"), device)?;
-                    let up_experts = ct.tensor(&format!("{prefix}.ffn_up_exps.weight"), device)?;
-                    let down_experts =
-                        ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), device)?;
-                    let shared_expert = load_shared_expert(&mut ct, &prefix, device)?;
-                    MoeOrMlp::FusedMoe(FusedMoe {
-                        gate: QMatMul::from_qtensor(gate)?,
-                        gate_experts: QMatMul::from_qtensor(gate_experts)?,
-                        up_experts: QMatMul::from_qtensor(up_experts)?,
-                        down_experts: QMatMul::from_qtensor(down_experts)?,
-                        shared_expert,
-                        norm_topk_prob: moe_cfg.norm_topk_prob,
-                        num_experts_per_tok: moe_cfg.num_experts_per_tok,
-                    })
+                let ssm_mlp = Mlp {
+                    feed_forward_w1: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(
+                            ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?,
+                        ),
+                        b: None,
+                    })?),
+                    feed_forward_w2: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(
+                            ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?,
+                        ),
+                        b: None,
+                    })?),
+                    feed_forward_w3: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?),
+                        b: None,
+                    })?),
                 };
                 // Qwen3.5/3.6 uses post_attention_norm instead of ffn_norm
                 let ssm_attn_norm = ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
@@ -1054,57 +843,27 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     .clone();
 
                 let attention_wq = ct.tensor(&format!("{prefix}.attn_q.weight"), device)?;
-                let has_attn_gate = attention_wq.shape().dims()[0] == head_count * head_dim * 2;
                 let attention_wk = ct.tensor(&format!("{prefix}.attn_k.weight"), device)?;
                 let attention_wv = ct.tensor(&format!("{prefix}.attn_v.weight"), device)?;
                 let attention_wo = ct.tensor(&format!("{prefix}.attn_output.weight"), device)?;
 
-                let mlp = if !moe_cfg
-                    .mlp_only_layers
-                    .as_ref()
-                    .unwrap()
-                    .contains(&layer_idx)
-                    && (moe_cfg.num_experts.unwrap() > 0
-                        && (layer_idx + 1) % moe_cfg.decoder_sparse_step.unwrap() == 0)
-                {
-                    let gate = ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
-                    let gate_experts =
-                        ct.tensor(&format!("{prefix}.ffn_gate_exps.weight"), device)?;
-                    let up_experts = ct.tensor(&format!("{prefix}.ffn_up_exps.weight"), device)?;
-                    let down_experts =
-                        ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), device)?;
-                    let shared_expert = load_shared_expert(&mut ct, &prefix, device)?;
-                    let moe = FusedMoe {
-                        gate: QMatMul::from_qtensor(gate)?,
-                        gate_experts: QMatMul::from_qtensor(gate_experts)?,
-                        up_experts: QMatMul::from_qtensor(up_experts)?,
-                        down_experts: QMatMul::from_qtensor(down_experts)?,
-                        shared_expert,
-                        norm_topk_prob: moe_cfg.norm_topk_prob,
-                        num_experts_per_tok: moe_cfg.num_experts_per_tok,
-                    };
-                    MoeOrMlp::FusedMoe(moe)
-                } else {
-                    let feed_forward_w1 =
-                        ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?;
-                    let feed_forward_w2 =
-                        ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
-                    let feed_forward_w3 = ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
-                    let mlp = Mlp {
-                        feed_forward_w1: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                            q_weight: Arc::new(feed_forward_w1),
-                            b: None,
-                        })?),
-                        feed_forward_w2: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                            q_weight: Arc::new(feed_forward_w2),
-                            b: None,
-                        })?),
-                        feed_forward_w3: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                            q_weight: Arc::new(feed_forward_w3),
-                            b: None,
-                        })?),
-                    };
-                    MoeOrMlp::Mlp(mlp)
+                let mlp = Mlp {
+                    feed_forward_w1: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(
+                            ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?,
+                        ),
+                        b: None,
+                    })?),
+                    feed_forward_w2: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(
+                            ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?,
+                        ),
+                        b: None,
+                    })?),
+                    feed_forward_w3: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?),
+                        b: None,
+                    })?),
                 };
 
                 // Qwen3 always has q_norm and k_norm
@@ -1154,7 +913,6 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     n_head: head_count,
                     n_kv_head: head_count_kv,
                     head_dim,
-                    has_attn_gate,
                     rotary: rotary.clone(),
                     paged_attn,
                     sdpa_params: SdpaParams {
@@ -1208,8 +966,8 @@ impl ModelWeights {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         // Hidden states run F32 on every device: norm and SSM side weights dequantize to F32
-        // and candle's rms_norm/binary ops require matching dtypes. The embedding table is
-        // CPU-resident; mapper.map()/remote hops only change device, never dtype.
+        // and candle's rms_norm/binary ops require matching dtypes. The BF16 embedding table
+        // and mapper.map()/remote hops only change device, never dtype.
         let mut layer_in = self
             .tok_embeddings
             .forward(&x.to_device(&Device::Cpu)?)?
@@ -1247,9 +1005,7 @@ impl ModelWeights {
         }
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(ref mapper) = self.mapper {
-                // Hidden states run F32 on every device (norm/SSM side weights dequantize to
-                // F32 and rms_norm requires matching dtypes); map()/remote hops never cast.
-                // to_dtype is a no-op clone when already F32.
+                // to_dtype is a no-op clone when already F32
                 layer_in = mapper.map(layer_in, i)?.to_dtype(DType::F32)?;
             }
             let layer = match layer {

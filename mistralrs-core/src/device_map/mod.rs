@@ -147,9 +147,7 @@ impl DeviceMapMetadata {
         let has_remote = layer_specs.iter().any(|d| d.is_remote());
 
         if has_remote {
-            info!(
-                "Loading model with remote layer mapping based on topology:"
-            );
+            info!("Loading model with remote layer mapping based on topology:");
             for (i, spec) in layer_specs.iter().enumerate() {
                 match spec {
                     crate::topology::RemoteAwareDevice::Local(dev) => {
@@ -184,13 +182,9 @@ impl DeviceMapMetadata {
             let mut peer_devices = local_mappings.clone();
             peer_devices.push(device.clone());
             let cuda_peer_access = CudaPeerAccess::new(&peer_devices)?;
-            let local_mapper = LayerDeviceMapper::new(
-                local_mappings,
-                device.clone(),
-                cuda_peer_access,
-            );
-            let connection_pool =
-                RemoteConnectionPool::new(&layer_specs)?;
+            let local_mapper =
+                LayerDeviceMapper::new(local_mappings, device.clone(), cuda_peer_access);
+            let connection_pool = RemoteConnectionPool::new(&layer_specs)?;
             Ok(Box::new(RemoteLayerMapper::new(
                 local_mapper,
                 connection_pool,

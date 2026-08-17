@@ -41,6 +41,7 @@ use crate::{
     models::quantized_phi3::ModelWeights as QPhi3,
     models::quantized_qwen::ModelWeights as QQwen,
     models::quantized_qwen3::ModelWeights as QQwen3,
+    models::quantized_qwen35::ModelWeights as QQwen35,
     models::quantized_qwen3_moe::ModelWeights as QQwen3MoE,
     models::quantized_starcoder2::ModelWeights as QStarcoder2,
     xlora_models::{XLoraQLlama, XLoraQPhi3},
@@ -70,6 +71,7 @@ enum Model {
     Qwen(QQwen),
     Qwen3(QQwen3),
     Qwen3MoE(QQwen3MoE),
+    Qwen35(QQwen35),
 }
 
 pub struct GGUFPipeline {
@@ -94,10 +96,21 @@ impl GGUFPipeline {
         cache: &mut [crate::kv_cache::KvCache],
     ) -> candle_core::Result<candle_core::Tensor> {
         match &self.model {
-            Model::Llama(m) => m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache),
-            Model::Qwen(m) => m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache),
-            Model::Qwen3(m) => m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache),
-            Model::Qwen3MoE(m) => m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache),
+            Model::Llama(m) => {
+                m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache)
+            }
+            Model::Qwen(m) => {
+                m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache)
+            }
+            Model::Qwen3(m) => {
+                m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache)
+            }
+            Model::Qwen3MoE(m) => {
+                m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache)
+            }
+            Model::Qwen35(m) => {
+                m.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, cache)
+            }
             _ => candle_core::bail!("forward_from_layer not implemented for this architecture"),
         }
     }
@@ -346,40 +359,58 @@ impl Loader for GGUFLoader {
         let arch = model.arch();
 
         // If auto, convert to Map
-        let num_layers = model.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
+        // MTP/nextn blocks sit at the tail of the stack but are not part of the trunk pass
+        let nextn_layers = model
+            .get_metadata()
+            .get(&format!("{arch}.nextn_predict_layers"))
+            .map(|v| v.to_u32())
+            .transpose()?
+            .unwrap_or(0) as usize;
+        let num_layers =
+            model.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize - nextn_layers;
 
         let mut max_kv_tokens: Option<usize> = None;
 
         if let DeviceMapSetting::Auto(params) = mapper.clone() {
-            let devices = device_map::get_all_similar_devices(device)?;
-            // Initial dtype
-            let dtype = dtype.try_into_dtype(&devices.iter().collect::<Vec<_>>())?;
+            if self.config.topology.is_some() {
+                // Topology fully determines the mapping; skip capacity-based auto mapping.
+                mapper = DeviceMapSetting::Map(device_map::DeviceMapMetadata::dummy());
+            } else {
+                let devices = device_map::get_all_similar_devices(device)?;
+                // Initial dtype
+                let dtype = dtype.try_into_dtype(&devices.iter().collect::<Vec<_>>())?;
 
-            let model = GgufDeviceMapLoaderInner {
-                model: &model,
-                arch,
-            };
+                let model = GgufDeviceMapLoaderInner {
+                    model: &model,
+                    arch,
+                };
 
-            let layer_sizes_in_bytes =
-                model.layer_sizes_in_bytes("this is a dummy config!", dtype, 1, None)?;
-            let non_mapped_size_in_bytes =
-                model.non_mapped_size_in_bytes("this is a dummy config!", dtype, 1, None, None)?;
-            let total_model_size_in_bytes =
-                layer_sizes_in_bytes.iter().sum::<usize>() + non_mapped_size_in_bytes;
+                let layer_sizes_in_bytes =
+                    model.layer_sizes_in_bytes("this is a dummy config!", dtype, 1, None)?;
+                let non_mapped_size_in_bytes = model.non_mapped_size_in_bytes(
+                    "this is a dummy config!",
+                    dtype,
+                    1,
+                    None,
+                    None,
+                )?;
+                let total_model_size_in_bytes =
+                    layer_sizes_in_bytes.iter().sum::<usize>() + non_mapped_size_in_bytes;
 
-            let new = model.get_device_layers(
-                "this is a dummy config!",
-                num_layers,
-                layer_sizes_in_bytes,
-                non_mapped_size_in_bytes,
-                total_model_size_in_bytes,
-                &devices,
-                dtype,
-                &params,
-                paged_attn_config.as_ref(),
-            )?;
-            max_kv_tokens = Some(params.max_seq_len() * params.max_batch_size());
-            mapper = DeviceMapSetting::Map(new);
+                let new = model.get_device_layers(
+                    "this is a dummy config!",
+                    num_layers,
+                    layer_sizes_in_bytes,
+                    non_mapped_size_in_bytes,
+                    total_model_size_in_bytes,
+                    &devices,
+                    dtype,
+                    &params,
+                    paged_attn_config.as_ref(),
+                )?;
+                max_kv_tokens = Some(params.max_seq_len() * params.max_batch_size());
+                mapper = DeviceMapSetting::Map(new);
+            }
         }
 
         #[cfg(feature = "cuda")]
@@ -499,7 +530,10 @@ impl Loader for GGUFLoader {
                 }
                 GGUFArchitecture::Qwen2 => Model::Qwen(QQwen::try_from(model_config)?),
                 GGUFArchitecture::Qwen3 => Model::Qwen3(QQwen3::try_from(model_config)?),
-                GGUFArchitecture::Qwen3MoE | GGUFArchitecture::Qwen35MoE => Model::Qwen3MoE(QQwen3MoE::try_from(model_config)?),
+                GGUFArchitecture::Qwen3MoE | GGUFArchitecture::Qwen35MoE => {
+                    Model::Qwen3MoE(QQwen3MoE::try_from(model_config)?)
+                }
+                GGUFArchitecture::Qwen35 => Model::Qwen35(QQwen35::try_from(model_config)?),
                 a => bail!("Unsupported architecture `{a:?}` for GGUF"),
             },
             ModelKind::GgufAdapter { adapter, .. } => match arch {
@@ -566,6 +600,7 @@ impl Loader for GGUFLoader {
             Model::Qwen(ref p) => p.max_seq_len,
             Model::Qwen3(ref p) => p.max_seq_len,
             Model::Qwen3MoE(ref p) => p.max_seq_len,
+            Model::Qwen35(ref p) => p.max_seq_len,
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model {
@@ -578,6 +613,7 @@ impl Loader for GGUFLoader {
             Model::Qwen(ref model) => model.cache.normal().0.len(),
             Model::Qwen3(ref model) => model.cache.normal().0.len(),
             Model::Qwen3MoE(ref model) => model.cache.normal().0.len(),
+            Model::Qwen35(ref model) => model.cache.normal().0.len(),
         };
 
         if chat_template.bos_token.is_none() {
@@ -722,6 +758,7 @@ impl CacheManagerMixin for GGUFPipeline {
             Model::Qwen(ref model) => &model.cache,
             Model::Qwen3(ref model) => &model.cache,
             Model::Qwen3MoE(ref model) => &model.cache,
+            Model::Qwen35(ref model) => &model.cache,
         }
     }
 }
@@ -738,6 +775,7 @@ impl MetadataMixin for GGUFPipeline {
             Model::Qwen(ref model) => model.device.clone(),
             Model::Qwen3(ref model) => model.device.clone(),
             Model::Qwen3MoE(ref model) => model.device.clone(),
+            Model::Qwen35(ref model) => model.device.clone(),
         }
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
@@ -840,6 +878,9 @@ impl Pipeline for GGUFPipeline {
             Model::Qwen3MoE(ref model) => {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
+            Model::Qwen35(ref model) => {
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+            }
         };
         if return_raw_logits {
             Ok(ForwardInputsResult::RawLogits { logits })
@@ -868,10 +909,22 @@ impl Pipeline for GGUFPipeline {
         end_layer: usize,
         past_kv_len: usize,
     ) -> candle_core::Result<Tensor> {
-        eprintln!("[PIPELINE] forward_from_layer: layers={}-{} past_kv={}", start_layer, end_layer, past_kv_len);
+        eprintln!(
+            "[PIPELINE] forward_from_layer: layers={}-{} past_kv={}",
+            start_layer, end_layer, past_kv_len
+        );
         let mut cache_guard = self.cache().normal();
-        let result = self.forward_from_layer(hidden, start_layer, end_layer, past_kv_len, &mut cache_guard.0);
-        eprintln!("[PIPELINE] forward_from_layer: done layers={}-{}", start_layer, end_layer);
+        let result = self.forward_from_layer(
+            hidden,
+            start_layer,
+            end_layer,
+            past_kv_len,
+            &mut cache_guard.0,
+        );
+        eprintln!(
+            "[PIPELINE] forward_from_layer: done layers={}-{}",
+            start_layer, end_layer
+        );
         result
     }
 

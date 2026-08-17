@@ -115,11 +115,10 @@ impl Topology {
             l.as_ref()
                 .and_then(|lt| lt.device.as_ref())
                 .is_some_and(|d| d.is_remote())
-        }) || self.patterns.iter().any(|(_, topo)| {
-            topo.device
-                .as_ref()
-                .is_some_and(|d| d.is_remote())
-        })
+        }) || self
+            .patterns
+            .iter()
+            .any(|(_, topo)| topo.device.as_ref().is_some_and(|d| d.is_remote()))
     }
 
     pub fn with_range(mut self, range: Range<usize>, layer: LayerTopology) -> Self {

@@ -38,7 +38,7 @@ pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder};
 pub(crate) use embedding::EmbeddingLoadContext;
 pub use embedding::{EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingSpecificConfig};
 pub use ggml::{GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig};
-pub use gguf::{GGUFPipeline, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
+pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFPipeline, GGUFSpecificConfig};
 use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
 pub(crate) use isq::IsqModelLoader;

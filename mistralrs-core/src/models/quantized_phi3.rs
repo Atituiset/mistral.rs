@@ -418,6 +418,7 @@ impl ModelWeights {
             xs = (ys + residual)?
         }
         let xs = xs
+            .to_device(&self.device)?
             .apply(&self.output_norm)?
             .i((.., seq_len - 1, ..))?
             .contiguous()?;

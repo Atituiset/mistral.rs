@@ -59,7 +59,13 @@ impl CublasLTBatchMatmulF8Scalar {
         let (b_0, n, b_2) = b_l.shape().dims3()?;
 
         if b_2 != k {
-            candle_core::bail!("This layer only supports TN layout");
+            candle_core::bail!(
+                "This layer only supports TN layout (a {:?} strides {:?}, b {:?} strides {:?})",
+                a_l.shape(),
+                a_l.stride(),
+                b_l.shape(),
+                b_l.stride()
+            );
         }
 
         if b_0 != batch_size {
@@ -371,7 +377,13 @@ impl CublasLTBatchMatmul {
         let (b_0, n, b_2) = b_l.shape().dims3()?;
 
         if b_2 != k {
-            candle_core::bail!("This layer only supports TN layout");
+            candle_core::bail!(
+                "This layer only supports TN layout (a {:?} strides {:?}, b {:?} strides {:?})",
+                a_l.shape(),
+                a_l.stride(),
+                b_l.shape(),
+                b_l.stride()
+            );
         }
 
         if b_0 != batch_size {
