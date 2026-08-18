@@ -1,6 +1,6 @@
 <a name="top"></a>
 
-> **Fork note (Atituiset/mistral.rs, branch `feat/remote-layer-split`)**: 本 fork 在 upstream 之上增加了 **TCP 远程层卸载（跨机分层推理）** 和 **Qwen3.5/3.6 GGUF 支持**（混合 Gated DeltaNet SSM + Full Attention，dense `qwen35` 与 MoE `qwen35moe`），共 18 个自定义 commits（`f4cb782b9` → `f19aaaa88`）。已在 GPU PC（RTX 4050 6GB）+ WSL 双机上验证 Qwen3.6-27B（decode 2.42 T/s）与 Qwen3.6-35B-A3B 三段拓扑（cuda + cpu + remote）端到端推理。实验记录见主仓库 [hetero-llama](https://github.com/Atituiset/hetero-llama) 的 `mistralrs-bridge/` 目录。
+> **Fork note (Atituiset/mistral.rs, branch `feat/remote-layer-split`)**: 本 fork 在 upstream 之上增加了 **TCP 远程层卸载（跨机分层推理）** 和 **Qwen3.5/3.6/3.8 GGUF 支持**（混合 Gated DeltaNet SSM + Full Attention，dense `qwen35` 与 MoE `qwen35moe`），共 19 个自定义 commits（`f4cb782b9` → `a9f7a8d3b`），含 x86 CPU 稀疏 MoE 前向（35B-A3B 提速 ~200x）。已在 GPU PC（RTX 4050 6GB）+ WSL 双机上验证 Qwen3.6-27B（decode 2.42 T/s）、Qwen3.8-27B（2.56 T/s）与 Qwen3.6-35B-A3B（~3.4 T/s）三段拓扑（cuda + cpu + remote）端到端推理。实验记录见主仓库 [hetero-llama](https://github.com/Atituiset/hetero-llama) 的 `mistralrs-bridge/` 目录。
 >
 > ---
 >
